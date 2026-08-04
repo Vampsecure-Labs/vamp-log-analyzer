@@ -596,7 +596,7 @@ RE_AUTH_CRON = re.compile(r'(?:CRON|cron)\[.*\]:\s+\((\S+)\)\s+CMD\s+\((.+)\)')
 _BSD_MONTHS = {m: i for i, m in enumerate(
     ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], 1
 )}
-_CURRENT_YEAR = datetime.datetime.utcnow().year
+_CURRENT_YEAR = datetime.datetime.now(datetime.timezone.utc).year
 
 
 def _parse_auth_ts(raw: str) -> Optional[datetime.datetime]:
@@ -674,7 +674,7 @@ def parse_syslog(path: str) -> Generator[LogEvent, None, None]:
                     ts = None
                     if ts_us:
                         try:
-                            ts = datetime.datetime.utcfromtimestamp(int(ts_us) / 1e6)
+                            ts = datetime.datetime.fromtimestamp(int(ts_us) / 1e6, tz=datetime.timezone.utc).replace(tzinfo=None)
                         except (ValueError, OverflowError):
                             pass
                     yield LogEvent(
@@ -1494,7 +1494,7 @@ def analyze_files(
 
     return Report(
         tool=TOOL, version=VERSION,
-        generated=datetime.datetime.utcnow().isoformat() + "Z",
+        generated=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         sources=paths,
         time_range_start=ts_min.isoformat() if ts_min else None,
         time_range_end=ts_max.isoformat() if ts_max else None,
