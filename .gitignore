@@ -8,6 +8,7 @@ __pycache__/
 *.log
 *.xml
 *.json
+*.html
 !requirements*.txt
 venv/
 .venv/
