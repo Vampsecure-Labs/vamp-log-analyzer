@@ -92,6 +92,30 @@ VERSION = "1.0"
 TOOL = "vamp-log-analyzer"
 FINDING_PREFIX = "FORA"
 
+BANNER = r"""
+  ____   ____    _    __  __ ____  _____ ____ _   _ ____  _____   _        _    ____ ____
+ \ \ / / _  |  / \  |  \/  |  _ \/ ____/ ___| | | |  _ \| ____| | |      / \  | __ ) ___|
+  \ V / (_| | / _ \ | |\/| | |_) \___ \| |___| | | | |_) |  _|   | |     / _ \ |  _ \___ \
+   | |  \__, |/ ___ \| |  | |  __/ ___) |___  | |_| |  _ <| |___  | |___ / ___ \| |_) |__) |
+   |_|     /_/_/   \_|_|  |_|_|   |____/\____|\___/|_| \_|_____| |_____/_/   \_|____/____/
+     by VampSecure Studios · vamp-log-analyzer v1.0 · Forensic Log Analysis Platform
+     ─────────────────────────────────────────────────────────────────────────────────
+     USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
+"""
+
+# ANSI: negrita magenta (coincide con el estilo del resto del toolkit)
+_ANSI_BOLD_MAGENTA = "\033[1;35m"
+_ANSI_RESET        = "\033[0m"
+
+
+def print_banner() -> None:
+    """Imprime la cabecera ASCII del toolkit VampSecure Labs."""
+    try:
+        print(f"{_ANSI_BOLD_MAGENTA}{BANNER}{_ANSI_RESET}", file=sys.stderr)
+    except UnicodeEncodeError:
+        # Fallback para terminales con encoding limitado
+        print(BANNER, file=sys.stderr)
+
 # ============================================================
 # PATRONES DE DETECCIÓN
 # ============================================================
@@ -1981,6 +2005,7 @@ def print_summary(report: Report) -> None:
 
 
 def main() -> int:
+    print_banner()
     parser = argparse.ArgumentParser(
         prog=TOOL,
         description="Analizador forense de logs multiplataforma — VampSecure Labs",
