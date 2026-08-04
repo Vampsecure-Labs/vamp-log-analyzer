@@ -47,6 +47,10 @@ Detecciones:
   FORA-019  Acceso a archivos sensibles del sistema
   FORA-020  Login directo como root / SYSTEM
   FORA-021  Técnica de evasión de defensa (ofuscación, encoding)
+  FORA-022  Credential stuffing (mismas credenciales, múltiples IPs)
+  FORA-023  Baliza C2 — peticiones HTTP periódicas a intervalos regulares
+  FORA-024  Fuerza bruta lenta (slow drip) distribuida en el tiempo
+  FORA-025  Respuesta POST anormalmente grande (exfiltración vía API)
 
 AUTORÍA
 -------
@@ -71,16 +75,22 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import dataclasses
 import datetime
 import gzip
+import hashlib
+import io
 import ipaddress
 import json
 import os
 import pathlib
 import re
+import statistics
 import sys
 import textwrap
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Dict, Generator, Iterable, List, Optional, Tuple
 
@@ -88,7 +98,7 @@ from typing import Dict, Generator, Iterable, List, Optional, Tuple
 # VERSIÓN Y METADATOS
 # ============================================================
 
-VERSION = "1.0"
+VERSION = "2.0"
 TOOL = "vamp-log-analyzer"
 FINDING_PREFIX = "FORA"
 
@@ -98,7 +108,7 @@ BANNER = r"""
   \ V / (_| | / _ \ | |\/| | |_) \___ \| |___| | | | |_) |  _|   | |     / _ \ |  _ \___ \
    | |  \__, |/ ___ \| |  | |  __/ ___) |___  | |_| |  _ <| |___  | |___ / ___ \| |_) |__) |
    |_|     /_/_/   \_|_|  |_|_|   |____/\____|\___/|_| \_|_____| |_____/_/   \_|____/____/
-     by VampSecure Studios · vamp-log-analyzer v1.0 · Forensic Log Analysis Platform
+     by VampSecure Studios · vamp-log-analyzer v2.0 · Forensic Log Analysis Platform
      ─────────────────────────────────────────────────────────────────────────────────
      USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
 """
@@ -253,6 +263,38 @@ RE_WIN_EVASION = re.compile(
 )
 
 # ============================================================
+# MAPEO MITRE ATT&CK
+# ============================================================
+
+MITRE_MAPPING: Dict[str, dict] = {
+    "FORA-001": {"tactic": "Credential Access",    "technique": "T1110.001 — Brute Force: Password Guessing (SSH)"},
+    "FORA-002": {"tactic": "Credential Access",    "technique": "T1110.001 — Brute Force: Password Guessing (HTTP)"},
+    "FORA-003": {"tactic": "Credential Access",    "technique": "T1110.003 — Brute Force: Password Spraying"},
+    "FORA-004": {"tactic": "Initial Access",       "technique": "T1190 — Exploit Public-Facing Application (SQLi web)"},
+    "FORA-005": {"tactic": "Initial Access",       "technique": "T1190 — Exploit Public-Facing Application (SQLi DB)"},
+    "FORA-006": {"tactic": "Initial Access",       "technique": "T1190 — Exploit Public-Facing Application (XSS)"},
+    "FORA-007": {"tactic": "Initial Access",       "technique": "T1190 — Exploit Public-Facing Application (LFI/RFI)"},
+    "FORA-008": {"tactic": "Execution",            "technique": "T1505.003 — Server Software Component: Web Shell"},
+    "FORA-009": {"tactic": "Reconnaissance",       "technique": "T1595 — Active Scanning"},
+    "FORA-010": {"tactic": "Reconnaissance",       "technique": "T1595.001 — Active Scanning: Directory Fuzzing"},
+    "FORA-011": {"tactic": "Exfiltration",         "technique": "T1048 — Exfiltration Over Alternative Protocol"},
+    "FORA-012": {"tactic": "Collection",           "technique": "T1213 — Data from Information Repositories"},
+    "FORA-013": {"tactic": "Privilege Escalation", "technique": "T1548 — Abuse Elevation Control Mechanism"},
+    "FORA-014": {"tactic": "Persistence",          "technique": "T1136 — Create Account"},
+    "FORA-015": {"tactic": "Defense Evasion",      "technique": "T1036 — Masquerading (horario inusual)"},
+    "FORA-016": {"tactic": "Persistence",          "technique": "T1053 — Scheduled Task/Job"},
+    "FORA-017": {"tactic": "Execution",            "technique": "T1059 — Command and Scripting Interpreter"},
+    "FORA-018": {"tactic": "Lateral Movement",     "technique": "T1021 — Remote Services"},
+    "FORA-019": {"tactic": "Discovery",            "technique": "T1083 — File and Directory Discovery"},
+    "FORA-020": {"tactic": "Initial Access",       "technique": "T1078.003 — Valid Accounts: Local Accounts (root)"},
+    "FORA-021": {"tactic": "Defense Evasion",      "technique": "T1027 — Obfuscated Files or Information"},
+    "FORA-022": {"tactic": "Credential Access",    "technique": "T1110.004 — Brute Force: Credential Stuffing"},
+    "FORA-023": {"tactic": "Command and Control",  "technique": "T1071.001 — Application Layer Protocol: Web Protocols (C2 beacon)"},
+    "FORA-024": {"tactic": "Credential Access",    "technique": "T1110.001 — Brute Force: Slow Drip"},
+    "FORA-025": {"tactic": "Exfiltration",         "technique": "T1041 — Exfiltration Over C2 Channel (POST response)"},
+}
+
+# ============================================================
 # MODELOS DE DATOS
 # ============================================================
 
@@ -316,6 +358,13 @@ class Report:
     total_events_parsed: int
     findings: List[Finding]
     timeline: List[dict]
+    # Campos extendidos (v2.0)
+    sessions: List[dict] = dataclasses.field(default_factory=list)
+    iocs: dict = dataclasses.field(default_factory=dict)
+    chain_of_custody: dict = dataclasses.field(default_factory=dict)
+    attack_chain: dict = dataclasses.field(default_factory=dict)
+    timeline_analysis: dict = dataclasses.field(default_factory=dict)
+    geoip_data: dict = dataclasses.field(default_factory=dict)
 
     @property
     def summary(self) -> dict:
@@ -1021,6 +1070,12 @@ class Detector:
         self._all_fail_users: Dict[str, List[str]] = collections.defaultdict(list)
         self._findings_raw: List[Finding] = []
         self._finding_counter = collections.Counter()
+        # FORA-022: credential stuffing — {usuario: [(ip, exito, evento), ...]}
+        self._login_attempts: Dict[str, List[tuple]] = collections.defaultdict(list)
+        # FORA-023: beacon C2 — {(ip, ruta): [timestamps]}
+        self._beacon_track: Dict[tuple, List[datetime.datetime]] = collections.defaultdict(list)
+        # FORA-024: slow drip — {ip: [eventos de fallo SSH en ventana 6h]}
+        self._slow_drip: Dict[str, List[LogEvent]] = collections.defaultdict(list)
 
     def _fid(self, n: int) -> str:
         self._finding_counter[n] += 1
@@ -1099,6 +1154,28 @@ class Detector:
                     "Implementar rate limiting y bloqueo temporal por IP en el servidor web. "
                     "Revisar si el recurso objetivo tiene autenticación débil.",
                 ))
+
+        # --- FORA-022: tracking credential stuffing ---
+        if event.action in ("SSH_OK", "SSH_FAIL") and event.user and event.ip:
+            exito = event.action == "SSH_OK"
+            self._login_attempts[event.user].append((event.ip, exito, event))
+
+        # --- FORA-023: tracking beacon C2 ---
+        if (event.log_type in ("web", "iis") and event.ip
+                and event.resource and event.timestamp and event.status == 200):
+            ruta = (event.resource or "").split("?")[0][:80]
+            if len(ruta) > 3:
+                key = (event.ip, ruta)
+                self._beacon_track[key].append(event.timestamp)
+
+        # --- FORA-024: tracking slow drip brute force ---
+        if event.action == "SSH_FAIL" and event.ip and event.timestamp:
+            self._slow_drip[event.ip].append(event)
+            cutoff = event.timestamp - datetime.timedelta(hours=6)
+            self._slow_drip[event.ip] = [
+                e for e in self._slow_drip[event.ip]
+                if e.timestamp and e.timestamp >= cutoff
+            ]
 
         # --- Enumeración de directorios (404 storm) ---
         if event.log_type in ("web", "iis") and event.status == 404 and event.ip:
@@ -1252,6 +1329,24 @@ class Detector:
                 "Revisar si el recurso debería ser accesible públicamente. "
                 "Implementar DLP (Data Loss Prevention) en el servidor.",
             ))
+
+        # --- FORA-025: Respuesta POST anormalmente grande ---
+        if event.log_type in ("web", "iis") and event.bytes_out:
+            resource_str = event.resource or ""
+            if resource_str.upper().startswith("POST ") and event.bytes_out > 1_048_576:
+                mb = event.bytes_out / 1_048_576
+                findings.append(self._make_finding(
+                    25, "HIGH",
+                    f"Respuesta POST grande ({mb:.1f} MB) → {event.ip or '?'}",
+                    f"Petición POST que genera respuesta de {mb:.1f} MB desde {event.ip or '?'}. "
+                    f"Posible exfiltración de datos vía formulario o API. "
+                    f"Recurso: {resource_str[:150]}",
+                    "Exfiltración — API web",
+                    [event],
+                    "Revisar el endpoint POST y qué datos devuelve. "
+                    "Verificar si la magnitud de la respuesta es esperable. "
+                    "Implementar límites de respuesta en el proxy o API gateway.",
+                ))
 
         # --- Consulta DB masiva ---
         if event.log_type in ("db_mysql", "db_postgres", "db_mongo"):
@@ -1417,7 +1512,8 @@ class Detector:
 
     def finalize(self) -> List[Finding]:
         """Devuelve todos los hallazgos acumulados (estadísticos + por evento)."""
-        # Password spray: pocos intentos por usuario, muchos usuarios distintos
+
+        # --- Password spray: pocos intentos por usuario, muchos usuarios distintos ---
         for ip, users in self._all_fail_users.items():
             unique = set(users)
             if len(unique) >= self.c["spray_users_min"] and len(users) < len(unique) * 3:
@@ -1434,6 +1530,105 @@ class Detector:
                         "Revisar si alguna cuenta fue comprometida. "
                         "Implementar MFA para todos los usuarios.",
                     ))
+
+        # --- FORA-022: Credential stuffing ---
+        # Patrón: múltiples IPs distintas fallan con el mismo usuario → luego una IP tiene éxito
+        for user, intentos in self._login_attempts.items():
+            ips_fallo = [ip for ip, ok, _ in intentos if not ok]
+            ips_exito = [ip for ip, ok, _ in intentos if ok]
+            ips_fallo_uniq = set(ips_fallo)
+            # Al menos 3 IPs distintas fallaron Y hubo al menos un éxito desde una IP diferente
+            if len(ips_fallo_uniq) >= 3 and ips_exito:
+                ip_exito = ips_exito[-1]
+                if ip_exito not in ips_fallo_uniq:
+                    ev_todos = [ev for _, _, ev in intentos]
+                    self._findings_raw.append(self._make_finding(
+                        22, "HIGH",
+                        f"Credential stuffing sobre la cuenta '{user}'",
+                        f"La cuenta '{user}' recibió intentos fallidos desde {len(ips_fallo_uniq)} IPs distintas "
+                        f"y posteriormente un acceso exitoso desde {ip_exito}. "
+                        f"Patrón compatible con relleno de credenciales.",
+                        "Acceso inicial — Credential stuffing",
+                        ev_todos,
+                        "Cambiar la contraseña de la cuenta afectada inmediatamente. "
+                        "Habilitar MFA. Revisar actividad posterior al login exitoso. "
+                        "Comprobar si las credenciales aparecen en filtraciones conocidas (HaveIBeenPwned).",
+                    ))
+
+        # --- FORA-023: Baliza C2 (beacon) ---
+        # Patrón: misma IP → misma ruta → >= 5 peticiones → intervalo muy regular (CoV < 0.15)
+        for (ip, ruta), timestamps in self._beacon_track.items():
+            if len(timestamps) < 5:
+                continue
+            timestamps_sorted = sorted(timestamps)
+            intervalos = [
+                (timestamps_sorted[i + 1] - timestamps_sorted[i]).total_seconds()
+                for i in range(len(timestamps_sorted) - 1)
+            ]
+            if not intervalos:
+                continue
+            media = sum(intervalos) / len(intervalos)
+            if media < 5:
+                continue  # demasiado rápido, no es un beacon
+            try:
+                desv = statistics.stdev(intervalos)
+                cov = desv / media if media > 0 else 1.0
+            except statistics.StatisticsError:
+                continue
+            if cov < 0.20 and media >= 10:
+                ev_dummy: List[LogEvent] = []
+                self._findings_raw.append(Finding(
+                    fid=self._fid(23),
+                    severity="HIGH",
+                    title=f"Posible baliza C2 desde {ip} → '{ruta}'",
+                    description=(
+                        f"IP {ip} realiza peticiones a '{ruta}' con un intervalo medio de "
+                        f"{media:.0f}s (CoV={cov:.2f}). Patrón altamente regular compatible "
+                        f"con un agente de comando y control."
+                    ),
+                    attack_phase="Mando y Control — C2 beacon",
+                    evidence=[f"Intervalo medio: {media:.0f}s | Desviación: {desv:.1f}s | CoV: {cov:.2f} | Peticiones: {len(timestamps)}"],
+                    events=ev_dummy,
+                    first_seen=timestamps_sorted[0],
+                    last_seen=timestamps_sorted[-1],
+                    ips=[ip],
+                    users=[],
+                    remediation=(
+                        "Bloquear la IP e investigar el host de origen. "
+                        "Revisar las peticiones completas en el log para identificar el payload. "
+                        "Comprobar si hay procesos en el servidor que escuchan en puertos inusuales."
+                    ),
+                ))
+
+        # --- FORA-024: Fuerza bruta lenta (slow drip) ---
+        # Patrón: >= 10 fallos SSH en 6h, pero < umbral para FORA-001 en cualquier ventana corta
+        brute_thresh = self.c["brute_threshold_ssh"]
+        for ip, eventos in self._slow_drip.items():
+            if len(eventos) < max(10, brute_thresh + 1):
+                continue
+            # Verificar que en ninguna ventana de 5 min superó el umbral normal (ya fue emitido por FORA-001)
+            ya_emitido_brute = any(
+                f.fid.startswith(f"{FINDING_PREFIX}-001") and ip in f.ips
+                for f in self._findings_raw
+            )
+            if ya_emitido_brute:
+                continue
+            if eventos[0].timestamp and eventos[-1].timestamp:
+                duracion = (eventos[-1].timestamp - eventos[0].timestamp).total_seconds()
+                if duracion >= 3600:  # distribuido en al menos 1 hora
+                    self._findings_raw.append(self._make_finding(
+                        24, "MEDIUM",
+                        f"Fuerza bruta lenta (slow drip) desde {ip}",
+                        f"{len(eventos)} intentos SSH fallidos desde {ip} distribuidos en "
+                        f"{duracion / 3600:.1f} horas. La baja cadencia evita el rate limiting, "
+                        f"pero el patrón acumulado es inequívocamente de fuerza bruta.",
+                        "Acceso inicial — Fuerza bruta lenta",
+                        eventos,
+                        "Implementar bloqueo por intentos acumulados en ventana larga (fail2ban recidive jail). "
+                        "Revisar si algún intento tuvo éxito. "
+                        "Considerar cambio de puerto SSH y lista blanca de IPs.",
+                    ))
+
         return self._findings_raw
 
 
@@ -1448,6 +1643,12 @@ def analyze_files(
     time_to: Optional[datetime.datetime],
     config: dict,
     verbose: bool = False,
+    *,
+    chain_of_custody: bool = False,
+    analyst: str = "",
+    case: str = "",
+    enable_geoip: bool = False,
+    session_gap_min: int = 30,
 ) -> Report:
     detector = Detector(config)
     all_findings: List[Finding] = []
@@ -1516,6 +1717,36 @@ def analyze_files(
     # Línea de tiempo ordenada
     timeline_events.sort(key=lambda e: e.get("ts") or "")
 
+    # --- Análisis forense extendido (v2.0) ---
+
+    # Análisis de línea de tiempo
+    ta = TimelineAnalyzer.analyze(timeline_events)
+
+    # Reconstrucción de sesiones por IP
+    sr = SessionReconstructor(gap_minutos=session_gap_min)
+    sesiones = sr.reconstruir(timeline_events)
+
+    # Extracción de IOCs
+    iocs = IOCExtractor.extraer(all_findings, timeline_events)
+
+    # Mapeo MITRE ATT&CK
+    attack_chain = AttackChainMapper.mapear(all_findings)
+
+    # Cadena de custodia (SHA-256)
+    coc: dict = {}
+    if chain_of_custody:
+        coc = ChainOfCustody.generar(paths, analyst=analyst, case=case)
+
+    # GeoIP (opcional, requiere red)
+    geoip: dict = {}
+    if enable_geoip:
+        todas_ips = list({ip for f in all_findings for ip in f.ips})
+        if todas_ips:
+            print(f"  [*] Resolviendo {len(todas_ips)} IPs vía GeoIP...", file=sys.stderr)
+            geoip = GeoIPResolver.resolver(todas_ips)
+            resueltas = len(geoip)
+            print(f"  [✓] {resueltas} IPs geolocalizadas.", file=sys.stderr)
+
     return Report(
         tool=TOOL, version=VERSION,
         generated=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1525,6 +1756,12 @@ def analyze_files(
         total_events_parsed=total_events,
         findings=all_findings,
         timeline=timeline_events,
+        sessions=sesiones,
+        iocs=iocs,
+        chain_of_custody=coc,
+        attack_chain=attack_chain,
+        timeline_analysis=ta,
+        geoip_data=geoip,
     )
 
 
@@ -1550,6 +1787,303 @@ def _deduplicate(findings: List[Finding]) -> List[Finding]:
             seen[key] = f
             out.append(f)
     return out
+
+
+# ============================================================
+# ANÁLISIS FORENSE — CLASES AUXILIARES
+# ============================================================
+
+class TimelineAnalyzer:
+    """Analiza la línea de tiempo unificada: detecta gaps, ráfagas y horas activas."""
+
+    # Umbral: gap > 1 hora se considera silencio significativo
+    GAP_THRESHOLD_SEC = 3600
+
+    @staticmethod
+    def analyze(timeline_events: List[dict]) -> dict:
+        """Recibe la lista de eventos de timeline y devuelve métricas forenses."""
+        timestamps = [
+            datetime.datetime.fromisoformat(e["ts"])
+            for e in timeline_events
+            if e.get("ts")
+        ]
+        if len(timestamps) < 2:
+            return {}
+
+        timestamps.sort()
+
+        # --- Intervalos entre eventos ---
+        intervalos = [
+            (timestamps[i + 1] - timestamps[i]).total_seconds()
+            for i in range(len(timestamps) - 1)
+        ]
+
+        # --- Gaps (silencios > 1h) ---
+        gaps = []
+        for i, intervalo in enumerate(intervalos):
+            if intervalo >= TimelineAnalyzer.GAP_THRESHOLD_SEC:
+                gaps.append({
+                    "inicio": timestamps[i].isoformat(),
+                    "fin": timestamps[i + 1].isoformat(),
+                    "duracion_h": round(intervalo / 3600, 2),
+                })
+
+        # --- Ráfagas (>= 10 eventos en 60s) ---
+        bursts = []
+        i = 0
+        while i < len(timestamps):
+            ventana = [timestamps[i]]
+            j = i + 1
+            while j < len(timestamps) and (timestamps[j] - timestamps[i]).total_seconds() <= 60:
+                ventana.append(timestamps[j])
+                j += 1
+            if len(ventana) >= 10:
+                bursts.append({
+                    "inicio": ventana[0].isoformat(),
+                    "fin": ventana[-1].isoformat(),
+                    "eventos": len(ventana),
+                })
+                i = j
+            else:
+                i += 1
+
+        # --- Distribución por hora UTC ---
+        hora_counter: Dict[int, int] = collections.Counter(ts.hour for ts in timestamps)
+        horas_activas = sorted(hora_counter.items())
+
+        # --- Primer y último evento ---
+        return {
+            "primer_evento": timestamps[0].isoformat(),
+            "ultimo_evento": timestamps[-1].isoformat(),
+            "duracion_total_h": round((timestamps[-1] - timestamps[0]).total_seconds() / 3600, 2),
+            "total_eventos_timeline": len(timestamps),
+            "gaps_silencio": gaps,
+            "rafagas": bursts,
+            "distribucion_por_hora_utc": {str(h): c for h, c in horas_activas},
+        }
+
+
+class SessionReconstructor:
+    """Agrupa eventos por IP y ventana temporal para reconstruir sesiones de atacante."""
+
+    def __init__(self, gap_minutos: int = 30):
+        self.gap_sec = gap_minutos * 60
+
+    def reconstruir(self, timeline_events: List[dict]) -> List[dict]:
+        """Devuelve lista de sesiones {ip, inicio, fin, eventos, hallazgos}."""
+        # Agrupar por IP
+        por_ip: Dict[str, List[dict]] = collections.defaultdict(list)
+        for ev in timeline_events:
+            if ev.get("ip") and ev.get("ts"):
+                por_ip[ev["ip"]].append(ev)
+
+        sesiones = []
+        for ip, eventos in por_ip.items():
+            eventos_sorted = sorted(eventos, key=lambda e: e["ts"])
+            # Dividir en sesiones según el gap
+            sesion_actual: List[dict] = [eventos_sorted[0]]
+            for ev in eventos_sorted[1:]:
+                try:
+                    t_prev = datetime.datetime.fromisoformat(sesion_actual[-1]["ts"])
+                    t_curr = datetime.datetime.fromisoformat(ev["ts"])
+                    if (t_curr - t_prev).total_seconds() > self.gap_sec:
+                        sesiones.append(self._construir_sesion(ip, sesion_actual))
+                        sesion_actual = [ev]
+                    else:
+                        sesion_actual.append(ev)
+                except (ValueError, KeyError):
+                    sesion_actual.append(ev)
+            sesiones.append(self._construir_sesion(ip, sesion_actual))
+
+        # Ordenar por peligrosidad (hallazgos CRITICAL/HIGH primero)
+        def sev_score(s):
+            return sum(1 for f in s["hallazgos_severidad"] if f in ("CRITICAL", "HIGH"))
+        sesiones.sort(key=sev_score, reverse=True)
+        return sesiones
+
+    @staticmethod
+    def _construir_sesion(ip: str, eventos: List[dict]) -> dict:
+        hallazgos = [ev["finding"] for ev in eventos if ev.get("finding")]
+        severidades = [ev["severity"] for ev in eventos if ev.get("severity") != "INFO"]
+        acciones = list(dict.fromkeys(ev.get("action", "") for ev in eventos if ev.get("action")))
+        rutas = list(dict.fromkeys(
+            ev.get("resource", "")[:80] for ev in eventos if ev.get("resource")
+        ))[:15]
+        return {
+            "ip": ip,
+            "inicio": eventos[0]["ts"],
+            "fin": eventos[-1]["ts"],
+            "num_eventos": len(eventos),
+            "hallazgos_fid": list(dict.fromkeys(hallazgos)),
+            "hallazgos_severidad": severidades,
+            "acciones": acciones[:10],
+            "rutas_accedidas": rutas,
+        }
+
+
+class IOCExtractor:
+    """Extrae indicadores de compromiso de hallazgos y eventos."""
+
+    @staticmethod
+    def extraer(findings: List[Finding], timeline_events: List[dict]) -> dict:
+        """Devuelve dict con listas de IPs, rutas, user-agents y usuarios sospechosos."""
+        ips: Dict[str, dict] = {}
+        rutas: Dict[str, int] = collections.Counter()
+        user_agents: Dict[str, int] = collections.Counter()
+        usuarios: Dict[str, int] = collections.Counter()
+
+        for f in findings:
+            for ip in f.ips:
+                if ip not in ips:
+                    ips[ip] = {"ip": ip, "severidad_max": f.severity, "hallazgos": []}
+                # Actualizar severidad máxima
+                if _severity_rank(f.severity) > _severity_rank(ips[ip]["severidad_max"]):
+                    ips[ip]["severidad_max"] = f.severity
+                ips[ip]["hallazgos"].append(f.fid)
+            for u in f.users:
+                usuarios[u] += 1
+
+        for ev in timeline_events:
+            if ev.get("resource"):
+                ruta = ev["resource"][:120]
+                if ev.get("severity") in ("CRITICAL", "HIGH"):
+                    rutas[ruta] += 1
+            if ev.get("ip"):
+                user_agents  # accedido desde IP, no UA directamente en timeline
+
+        # User-agents de los eventos del detector
+        # Los UAs no están en timeline; los obtenemos de los findings de FORA-009
+        for f in findings:
+            if "FORA-009" in f.fid:
+                for ev_raw in f.evidence:
+                    ua_match = re.search(r'"([^"]{10,200})"$', ev_raw)
+                    if ua_match:
+                        user_agents[ua_match.group(1)[:200]] += 1
+
+        return {
+            "ips_atacantes": sorted(ips.values(), key=lambda x: _severity_rank(x["severidad_max"]), reverse=True),
+            "rutas_objetivo": [{"ruta": r, "ocurrencias": c} for r, c in rutas.most_common(30)],
+            "user_agents_sospechosos": [{"ua": ua, "ocurrencias": c} for ua, c in user_agents.most_common(20)],
+            "usuarios_objetivo": [{"usuario": u, "ocurrencias": c} for u, c in usuarios.most_common(20)],
+        }
+
+
+class ChainOfCustody:
+    """Genera metadatos forenses: hashes SHA-256 de los ficheros analizados."""
+
+    @staticmethod
+    def generar(paths: List[str], analyst: str = "", case: str = "") -> dict:
+        ficheros = []
+        for p in paths:
+            try:
+                h = hashlib.sha256()
+                size = 0
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        h.update(chunk)
+                        size += len(chunk)
+                ficheros.append({
+                    "ruta": p,
+                    "nombre": os.path.basename(p),
+                    "sha256": h.hexdigest(),
+                    "tamaño_bytes": size,
+                })
+            except OSError:
+                ficheros.append({"ruta": p, "nombre": os.path.basename(p), "sha256": "ERROR", "tamaño_bytes": 0})
+
+        return {
+            "perito_analizador": analyst or "No especificado",
+            "referencia_caso": case or "No especificado",
+            "fecha_analisis_utc": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "herramienta": f"{TOOL} v{VERSION}",
+            "ficheros_evidencia": ficheros,
+        }
+
+
+class AttackChainMapper:
+    """Mapea los hallazgos a tácticas MITRE ATT&CK y construye la cadena de ataque."""
+
+    @staticmethod
+    def mapear(findings: List[Finding]) -> dict:
+        """Devuelve {táctica: [hallazgos]} ordenado por la kill chain típica."""
+        orden_tacticas = [
+            "Reconnaissance", "Resource Development", "Initial Access",
+            "Execution", "Persistence", "Privilege Escalation",
+            "Defense Evasion", "Credential Access", "Discovery",
+            "Lateral Movement", "Collection", "Command and Control",
+            "Exfiltration", "Impact",
+        ]
+
+        por_tactica: Dict[str, List[dict]] = collections.defaultdict(list)
+        for f in findings:
+            fid_base = f.fid[:8]  # e.g. "FORA-001"
+            info = MITRE_MAPPING.get(fid_base, {
+                "tactic": "Other",
+                "technique": "N/A",
+            })
+            por_tactica[info["tactic"]].append({
+                "fid": f.fid,
+                "severidad": f.severity,
+                "titulo": f.title,
+                "tecnica_mitre": info["technique"],
+                "ips": f.ips[:5],
+            })
+
+        # Ordenar según kill chain
+        resultado = {}
+        for tactica in orden_tacticas:
+            if tactica in por_tactica:
+                resultado[tactica] = por_tactica[tactica]
+        # Añadir tácticas no contempladas al final
+        for tactica, hallazgos in por_tactica.items():
+            if tactica not in resultado:
+                resultado[tactica] = hallazgos
+
+        return resultado
+
+
+class GeoIPResolver:
+    """Resuelve IPs a país y ASN usando ip-api.com (batch, sin dependencias externas)."""
+
+    BATCH_URL = "http://ip-api.com/batch"
+    BATCH_SIZE = 100
+
+    @staticmethod
+    def resolver(ips: List[str]) -> Dict[str, dict]:
+        """Devuelve {ip: {country, countryCode, org, as_, city}} para IPs públicas."""
+        ips_publicas = [ip for ip in ips if not _ip_is_private(ip) and ip != "?"]
+        ips_unicas = list(dict.fromkeys(ips_publicas))[:200]
+
+        resultado: Dict[str, dict] = {}
+        for i in range(0, len(ips_unicas), GeoIPResolver.BATCH_SIZE):
+            lote = ips_unicas[i:i + GeoIPResolver.BATCH_SIZE]
+            payload = json.dumps([
+                {"query": ip, "fields": "query,country,countryCode,regionName,city,isp,org,as,status"}
+                for ip in lote
+            ]).encode()
+            try:
+                req = urllib.request.Request(
+                    GeoIPResolver.BATCH_URL,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                for entry in data:
+                    if entry.get("status") == "success":
+                        resultado[entry["query"]] = {
+                            "pais": entry.get("country", ""),
+                            "codigo_pais": entry.get("countryCode", ""),
+                            "region": entry.get("regionName", ""),
+                            "ciudad": entry.get("city", ""),
+                            "isp": entry.get("isp", ""),
+                            "org": entry.get("org", ""),
+                            "asn": entry.get("as", ""),
+                        }
+            except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                pass  # GeoIP es opcional; no interrumpir si falla la red
+
+        return resultado
 
 
 # ============================================================
@@ -1593,6 +2127,216 @@ def to_json(report: Report) -> str:
         "timeline": report.timeline[:500],  # limitar a 500 entradas en JSON
     }
     return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def to_forensic_txt(report: Report) -> str:
+    """Genera informe forense completo en texto plano apto para peritaje."""
+    lineas: List[str] = []
+    sep = "=" * 80
+    sep2 = "-" * 80
+
+    def sec(titulo: str) -> None:
+        lineas.append("")
+        lineas.append(sep)
+        lineas.append(f"  {titulo}")
+        lineas.append(sep)
+
+    def subsec(titulo: str) -> None:
+        lineas.append("")
+        lineas.append(sep2)
+        lineas.append(f"  {titulo}")
+        lineas.append(sep2)
+
+    # --- Cabecera ---
+    lineas.append(sep)
+    lineas.append(f"  INFORME FORENSE DE ANÁLISIS DE LOGS")
+    lineas.append(f"  {TOOL} v{VERSION}  ·  © VampSecure Studios — VampSecure Labs")
+    lineas.append(sep)
+
+    # --- Cadena de custodia ---
+    coc = report.chain_of_custody
+    if coc:
+        sec("1. CADENA DE CUSTODIA Y METADATOS DEL ANÁLISIS")
+        lineas.append(f"  Perito/Analista     : {coc.get('perito_analizador', '—')}")
+        lineas.append(f"  Referencia del caso : {coc.get('referencia_caso', '—')}")
+        lineas.append(f"  Fecha de análisis   : {coc.get('fecha_analisis_utc', '—')}")
+        lineas.append(f"  Herramienta         : {coc.get('herramienta', '—')}")
+        lineas.append("")
+        lineas.append("  Ficheros de evidencia analizados:")
+        for fich in coc.get("ficheros_evidencia", []):
+            lineas.append(f"    · {fich['nombre']}")
+            lineas.append(f"        Ruta    : {fich['ruta']}")
+            lineas.append(f"        SHA-256 : {fich['sha256']}")
+            lineas.append(f"        Tamaño  : {fich['tamaño_bytes']:,} bytes")
+
+    # --- Resumen ejecutivo ---
+    sec("2. RESUMEN EJECUTIVO")
+    s = report.summary
+    lineas.append(f"  Fecha de generación    : {report.generated}")
+    lineas.append(f"  Eventos procesados     : {report.total_events_parsed:,}")
+    lineas.append(f"  Período analizado      : {report.time_range_start or '?'} → {report.time_range_end or '?'}")
+    lineas.append(f"  Ficheros de log        : {len(report.sources)}")
+    lineas.append("")
+    lineas.append(f"  Hallazgos CRITICAL     : {s['critical']:>4}")
+    lineas.append(f"  Hallazgos HIGH         : {s['high']:>4}")
+    lineas.append(f"  Hallazgos MEDIUM       : {s['medium']:>4}")
+    lineas.append(f"  Hallazgos LOW          : {s['low']:>4}")
+    lineas.append(f"  TOTAL HALLAZGOS        : {s['total']:>4}")
+
+    # --- Línea de tiempo ---
+    ta = report.timeline_analysis
+    if ta:
+        sec("3. ANÁLISIS DE LÍNEA DE TIEMPO")
+        lineas.append(f"  Primer evento    : {ta.get('primer_evento', '?')}")
+        lineas.append(f"  Último evento    : {ta.get('ultimo_evento', '?')}")
+        lineas.append(f"  Duración total   : {ta.get('duracion_total_h', 0):.1f} horas")
+        lineas.append(f"  Eventos timeline : {ta.get('total_eventos_timeline', 0)}")
+        gaps = ta.get("gaps_silencio", [])
+        if gaps:
+            lineas.append(f"\n  Períodos de silencio (gaps > 1h): {len(gaps)}")
+            for g in gaps[:10]:
+                lineas.append(f"    [{g['inicio']} → {g['fin']}]  ({g['duracion_h']}h)")
+        bursts = ta.get("rafagas", [])
+        if bursts:
+            lineas.append(f"\n  Ráfagas de actividad detectadas: {len(bursts)}")
+            for b in bursts[:10]:
+                lineas.append(f"    [{b['inicio']}]  {b['eventos']} eventos en < 60s")
+        dist = ta.get("distribucion_por_hora_utc", {})
+        if dist:
+            lineas.append("\n  Actividad por hora UTC (0h-23h):")
+            max_c = max(int(v) for v in dist.values()) if dist else 1
+            for h in range(24):
+                c = int(dist.get(str(h), 0))
+                bar = "█" * int(c * 30 / max_c) if max_c > 0 else ""
+                lineas.append(f"    {h:02d}h  {bar:<30} {c}")
+
+    # --- Cadena de ataque MITRE ---
+    if report.attack_chain:
+        sec("4. CADENA DE ATAQUE — MITRE ATT&CK")
+        for tactica, hallazgos in report.attack_chain.items():
+            lineas.append(f"\n  [{tactica}]")
+            for h in hallazgos:
+                lineas.append(f"    · {h['fid']} [{h['severidad']}]  {h['titulo'][:60]}")
+                lineas.append(f"      Técnica: {h['tecnica_mitre']}")
+                if h["ips"]:
+                    lineas.append(f"      IPs   : {', '.join(h['ips'])}")
+
+    # --- Sesiones reconstruidas ---
+    if report.sessions:
+        sec("5. SESIONES DE ATACANTE RECONSTRUIDAS")
+        for i, ses in enumerate(report.sessions[:30], 1):
+            lineas.append(f"\n  SESIÓN #{i}  IP: {ses['ip']}")
+            lineas.append(f"    Período    : {ses['inicio']} → {ses['fin']}")
+            lineas.append(f"    Eventos    : {ses['num_eventos']}")
+            if ses["hallazgos_fid"]:
+                lineas.append(f"    Hallazgos : {', '.join(ses['hallazgos_fid'][:8])}")
+            if ses["acciones"]:
+                lineas.append(f"    Acciones  : {', '.join(ses['acciones'][:8])}")
+            if ses["rutas_accedidas"]:
+                lineas.append("    Rutas:")
+                for r in ses["rutas_accedidas"][:5]:
+                    lineas.append(f"      · {r}")
+
+    # --- IOCs ---
+    iocs = report.iocs
+    if iocs:
+        sec("6. INDICADORES DE COMPROMISO (IOCs)")
+        ips_ioc = iocs.get("ips_atacantes", [])
+        if ips_ioc:
+            lineas.append(f"\n  IPs atacantes ({len(ips_ioc)} únicas):")
+            for entry in ips_ioc[:50]:
+                geo = report.geoip_data.get(entry["ip"], {})
+                geo_str = f"  [{geo.get('pais', '')} / {geo.get('isp', '')}]" if geo else ""
+                lineas.append(f"    · {entry['ip']:<18} [{entry['severidad_max']:<8}]{geo_str}")
+                lineas.append(f"      Hallazgos: {', '.join(entry['hallazgos'][:5])}")
+        rutas_ioc = iocs.get("rutas_objetivo", [])
+        if rutas_ioc:
+            lineas.append(f"\n  Rutas objetivo más atacadas:")
+            for entry in rutas_ioc[:20]:
+                lineas.append(f"    · ({entry['ocurrencias']:>4}x)  {entry['ruta']}")
+        ua_ioc = iocs.get("user_agents_sospechosos", [])
+        if ua_ioc:
+            lineas.append(f"\n  User-Agents de herramientas de ataque:")
+            for entry in ua_ioc[:10]:
+                lineas.append(f"    · ({entry['ocurrencias']:>3}x)  {entry['ua'][:100]}")
+        usr_ioc = iocs.get("usuarios_objetivo", [])
+        if usr_ioc:
+            lineas.append(f"\n  Usuarios objetivo (cuentas atacadas):")
+            for entry in usr_ioc[:20]:
+                lineas.append(f"    · ({entry['ocurrencias']:>4}x)  {entry['usuario']}")
+
+    # --- Hallazgos detallados ---
+    sec("7. HALLAZGOS DETALLADOS")
+    for f in report.findings:
+        subsec(f"{f.fid} [{f.severity}] — {f.title}")
+        lineas.append(f"  Descripción  : {f.description}")
+        lineas.append(f"  Fase ATT&CK  : {f.attack_phase}")
+        ts_ini = f.first_seen.strftime("%Y-%m-%d %H:%M:%S") if f.first_seen else "?"
+        ts_fin = f.last_seen.strftime("%Y-%m-%d %H:%M:%S") if f.last_seen else "?"
+        lineas.append(f"  Período      : {ts_ini} → {ts_fin} ({f.duration_str})")
+        lineas.append(f"  IPs          : {', '.join(f.ips[:10]) or '—'}")
+        lineas.append(f"  Usuarios     : {', '.join(f.users[:10]) or '—'}")
+        lineas.append(f"  Remediación  : {f.remediation}")
+        if f.evidence:
+            lineas.append("  Evidencias (máx 10 líneas):")
+            for ev in f.evidence[:10]:
+                lineas.append(f"    > {ev[:200]}")
+
+    # --- Pie de informe ---
+    lineas.append("")
+    lineas.append(sep)
+    lineas.append(f"  FIN DEL INFORME  ·  {TOOL} v{VERSION}")
+    lineas.append(f"  © VampSecure Studios — VampSecure Labs Security Research Division")
+    lineas.append(f"  Uso exclusivo en entornos autorizados.")
+    lineas.append(sep)
+
+    return "\n".join(lineas)
+
+
+def to_ioc_csv(report: Report) -> str:
+    """Exporta los IOCs en formato CSV para importar en SIEM o plataformas de inteligencia."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    writer.writerow(["tipo", "valor", "severidad", "hallazgos", "pais", "isp", "notas"])
+
+    iocs = report.iocs
+    for entry in iocs.get("ips_atacantes", []):
+        geo = report.geoip_data.get(entry["ip"], {})
+        writer.writerow([
+            "ip",
+            entry["ip"],
+            entry["severidad_max"],
+            " | ".join(entry["hallazgos"][:10]),
+            geo.get("pais", ""),
+            geo.get("isp", ""),
+            geo.get("asn", ""),
+        ])
+    for entry in iocs.get("rutas_objetivo", []):
+        writer.writerow([
+            "url_path",
+            entry["ruta"],
+            "HIGH",
+            f"ocurrencias:{entry['ocurrencias']}",
+            "", "", "",
+        ])
+    for entry in iocs.get("user_agents_sospechosos", []):
+        writer.writerow([
+            "user_agent",
+            entry["ua"],
+            "MEDIUM",
+            f"ocurrencias:{entry['ocurrencias']}",
+            "", "", "",
+        ])
+    for entry in iocs.get("usuarios_objetivo", []):
+        writer.writerow([
+            "username",
+            entry["usuario"],
+            "MEDIUM",
+            f"ocurrencias:{entry['ocurrencias']}",
+            "", "", "",
+        ])
+
+    return buf.getvalue()
 
 
 def _sev_color(sev: str) -> str:
@@ -1976,6 +2720,7 @@ def build_config(args) -> dict:
         "spray_users_min":      args.spray_min_users,
         "dir_enum_threshold":   args.dir_enum,
         "unusual_hours":        (args.night_from, args.night_to),
+        "top_n":                args.top_n,
     }
 
 
@@ -2030,9 +2775,26 @@ def main() -> int:
                         help="Analizar solo eventos hasta esta fecha UTC")
     parser.add_argument("--report-html", metavar="FICHERO", help="Guardar informe HTML")
     parser.add_argument("--report-json", metavar="FICHERO", help="Guardar informe JSON")
+    parser.add_argument("--report-forensic", metavar="FICHERO", dest="report_forensic",
+                        help="Guardar informe forense completo en texto plano (cadena de custodia, timeline, IOCs, ATT&CK)")
+    parser.add_argument("--ioc-csv", metavar="FICHERO", dest="ioc_csv",
+                        help="Exportar IOCs (IPs, rutas, UAs, usuarios) en formato CSV para SIEM")
     parser.add_argument("--min-severity", default="LOW",
                         choices=["INFO","LOW","MEDIUM","HIGH","CRITICAL"],
                         help="Severidad mínima a reportar (default: LOW)")
+    # Análisis forense
+    parser.add_argument("--chain-of-custody", action="store_true", dest="chain_of_custody",
+                        help="Incluir hashes SHA-256 de ficheros + metadatos forenses")
+    parser.add_argument("--analyst", metavar="NOMBRE", default="",
+                        help="Nombre del perito para el informe forense")
+    parser.add_argument("--case", metavar="REF", default="",
+                        help="Referencia del caso para el informe forense")
+    parser.add_argument("--geoip", action="store_true",
+                        help="Enriquecer IPs atacantes con país/ASN (requiere conexión a internet)")
+    parser.add_argument("--top-n", type=int, default=10, metavar="N", dest="top_n",
+                        help="Número de elementos en rankings de IPs/rutas/UAs (default: 10)")
+    parser.add_argument("--min-session-gap", type=int, default=30, metavar="MIN", dest="session_gap",
+                        help="Minutos de silencio para separar sesiones de atacante (default: 30)")
     # Umbrales
     parser.add_argument("--brute-window",   type=int, default=300,  metavar="S",  help="Ventana en segundos para brute force (default: 300)")
     parser.add_argument("--brute-ssh",      type=int, default=5,    metavar="N",  help="Umbral fallos SSH para alertar (default: 5)")
@@ -2068,7 +2830,14 @@ def main() -> int:
 
     # Análisis
     config = build_config(args)
-    report = analyze_files(paths, args.type, time_from, time_to, config, args.verbose)
+    report = analyze_files(
+        paths, args.type, time_from, time_to, config, args.verbose,
+        chain_of_custody=args.chain_of_custody,
+        analyst=args.analyst,
+        case=args.case,
+        enable_geoip=args.geoip,
+        session_gap_min=args.session_gap,
+    )
 
     # Filtrar por severidad mínima
     min_rank = _severity_rank(args.min_severity)
@@ -2078,17 +2847,33 @@ def main() -> int:
     print_summary(report)
 
     # Guardar informes
+    alguno_guardado = False
+
     if args.report_json:
         out = pathlib.Path(args.report_json)
         out.write_text(to_json(report), encoding="utf-8")
         print(f"[✓] JSON guardado en: {out}", file=sys.stderr)
+        alguno_guardado = True
 
     if args.report_html:
         out = pathlib.Path(args.report_html)
         out.write_text(to_html(report), encoding="utf-8")
         print(f"[✓] HTML guardado en: {out}", file=sys.stderr)
+        alguno_guardado = True
 
-    if not args.report_json and not args.report_html:
+    if getattr(args, "report_forensic", None):
+        out = pathlib.Path(args.report_forensic)
+        out.write_text(to_forensic_txt(report), encoding="utf-8")
+        print(f"[✓] Informe forense TXT guardado en: {out}", file=sys.stderr)
+        alguno_guardado = True
+
+    if getattr(args, "ioc_csv", None):
+        out = pathlib.Path(args.ioc_csv)
+        out.write_text(to_ioc_csv(report), encoding="utf-8")
+        print(f"[✓] IOCs CSV guardado en: {out}", file=sys.stderr)
+        alguno_guardado = True
+
+    if not alguno_guardado:
         print(to_json(report))
 
     # Código de salida
