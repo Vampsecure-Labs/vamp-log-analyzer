@@ -365,6 +365,7 @@ class Report:
     attack_chain: dict = dataclasses.field(default_factory=dict)
     timeline_analysis: dict = dataclasses.field(default_factory=dict)
     geoip_data: dict = dataclasses.field(default_factory=dict)
+    ip_profiles: dict = dataclasses.field(default_factory=dict)  # {ip: perfil de actividad completa}
 
     @property
     def summary(self) -> dict:
@@ -1698,6 +1699,10 @@ class Detector:
 
         return self._findings_raw
 
+    def get_ip_events(self) -> Dict[str, List[LogEvent]]:
+        """Devuelve todos los eventos acumulados por IP (para IPActivityProfiler)."""
+        return dict(self._ip_all_events)
+
 
 # ============================================================
 # MOTOR DE ANÁLISIS PRINCIPAL
@@ -1786,6 +1791,9 @@ def analyze_files(
 
     # --- Análisis forense extendido (v2.0) ---
 
+    # Perfiles de actividad por IP (siempre activo)
+    ip_profiles = IPActivityProfiler.perfilar(detector.get_ip_events())
+
     # Análisis de línea de tiempo
     ta = TimelineAnalyzer.analyze(timeline_events)
 
@@ -1829,6 +1837,7 @@ def analyze_files(
         attack_chain=attack_chain,
         timeline_analysis=ta,
         geoip_data=geoip,
+        ip_profiles=ip_profiles,
     )
 
 
@@ -2109,6 +2118,100 @@ class AttackChainMapper:
         return resultado
 
 
+class IPActivityProfiler:
+    """Construye perfiles de actividad completa por IP: días, horas, acciones, rutas, cuentas."""
+
+    @staticmethod
+    def perfilar(ip_events: Dict[str, List[LogEvent]]) -> Dict[str, dict]:
+        """
+        Recibe el dict {ip: [eventos]} del Detector y devuelve {ip: perfil_dict}.
+        Los perfiles se ordenan por número total de eventos (descendente).
+        """
+        perfiles: Dict[str, dict] = {}
+
+        for ip, eventos in sorted(ip_events.items(), key=lambda x: len(x[1]), reverse=True):
+            eventos_ts = sorted(
+                [e for e in eventos if e.timestamp],
+                key=lambda e: e.timestamp,
+            )
+
+            # --- Fechas y períodos ---
+            dias_set = sorted({e.timestamp.date().isoformat() for e in eventos_ts})
+            primer_ev = eventos_ts[0].timestamp.isoformat() if eventos_ts else None
+            ultimo_ev = eventos_ts[-1].timestamp.isoformat() if eventos_ts else None
+
+            # --- Distribución por hora UTC ---
+            dist_hora: Dict[int, int] = collections.Counter(e.timestamp.hour for e in eventos_ts)
+
+            # --- Distribución por día de semana (0=Lun … 6=Dom) ---
+            dias_semana_names = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+            dist_diasem: Dict[str, int] = collections.Counter()
+            for e in eventos_ts:
+                dist_diasem[dias_semana_names[e.timestamp.weekday()]] += 1
+
+            # --- Acciones ---
+            acciones = collections.Counter(
+                e.action for e in eventos if e.action and e.action not in ("INFO", "LOG")
+            )
+
+            # --- Recursos / rutas más accedidas ---
+            recursos = collections.Counter(
+                (e.resource or "")[:120] for e in eventos if e.resource
+            )
+
+            # --- Usuarios / cuentas ---
+            usuarios = sorted({e.user for e in eventos if e.user})
+
+            # --- Códigos HTTP ---
+            status_c = collections.Counter(e.status for e in eventos if e.status is not None)
+            exitos_http = sum(c for s, c in status_c.items() if isinstance(s, int) and 200 <= s < 300)
+            fallos_http = sum(c for s, c in status_c.items() if isinstance(s, int) and s >= 400)
+
+            # --- Éxitos/fallos de autenticación ---
+            exitos_auth = acciones.get("SSH_OK", 0) + acciones.get("LOGIN_OK", 0)
+            fallos_auth = (acciones.get("SSH_FAIL", 0) + acciones.get("LOGIN_FAIL", 0)
+                           + acciones.get("AUTH_FAIL", 0))
+
+            # --- Bytes transferidos ---
+            bytes_total = sum(e.bytes_out or 0 for e in eventos)
+
+            # --- Ficheros de log origen ---
+            fuentes = sorted({os.path.basename(e.source_file) for e in eventos})
+
+            # --- Actividad por franja horaria (para el informe) ---
+            franja_noche  = sum(dist_hora.get(h, 0) for h in range(0, 6))
+            franja_manana = sum(dist_hora.get(h, 0) for h in range(6, 12))
+            franja_tarde  = sum(dist_hora.get(h, 0) for h in range(12, 18))
+            franja_noche2 = sum(dist_hora.get(h, 0) for h in range(18, 24))
+
+            perfiles[ip] = {
+                "ip": ip,
+                "total_eventos": len(eventos),
+                "primer_evento": primer_ev,
+                "ultimo_evento": ultimo_ev,
+                "dias_activo": dias_set,
+                "num_dias": len(dias_set),
+                "distribucion_hora_utc": {str(h): dist_hora.get(h, 0) for h in range(24)},
+                "distribucion_diasemana": dict(dist_diasem),
+                "franja_madrugada_0_6h": franja_noche,
+                "franja_manana_6_12h": franja_manana,
+                "franja_tarde_12_18h": franja_tarde,
+                "franja_noche_18_24h": franja_noche2,
+                "acciones": dict(acciones.most_common(15)),
+                "recursos_top": [{"ruta": r, "accesos": c} for r, c in recursos.most_common(30)],
+                "usuarios_cuentas": usuarios,
+                "status_http_dist": {str(s): c for s, c in status_c.most_common()},
+                "exitos_http": exitos_http,
+                "fallos_http": fallos_http,
+                "exitos_auth": exitos_auth,
+                "fallos_auth": fallos_auth,
+                "bytes_total": bytes_total,
+                "fuentes_log": fuentes,
+            }
+
+        return perfiles
+
+
 class GeoIPResolver:
     """Resuelve IPs a país y ASN usando ip-api.com (batch, sin dependencias externas)."""
 
@@ -2191,7 +2294,13 @@ def to_json(report: Report) -> str:
         "total_events_parsed": report.total_events_parsed,
         "findings": findings_out,
         "summary": report.summary,
-        "timeline": report.timeline[:500],  # limitar a 500 entradas en JSON
+        "ip_profiles": list(report.ip_profiles.values())[:100],  # top 100 IPs
+        "attack_chain": report.attack_chain,
+        "iocs": report.iocs,
+        "timeline_analysis": report.timeline_analysis,
+        "chain_of_custody": report.chain_of_custody,
+        "geoip_data": report.geoip_data,
+        "timeline": report.timeline[:500],
     }
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
@@ -2332,8 +2441,66 @@ def to_forensic_txt(report: Report) -> str:
             for entry in usr_ioc[:20]:
                 lineas.append(f"    · ({entry['ocurrencias']:>4}x)  {entry['usuario']}")
 
+    # --- Perfiles de actividad por IP ---
+    if report.ip_profiles:
+        sec("7. PERFILES DE ACTIVIDAD POR IP")
+        lineas.append(f"  Total IPs únicas detectadas: {len(report.ip_profiles)}")
+        for ip, p in list(report.ip_profiles.items())[:50]:  # máximo 50 perfiles
+            geo = report.geoip_data.get(ip, {})
+            geo_str = f"  [{geo.get('pais','')} · {geo.get('isp','')}]" if geo else ""
+            lineas.append("")
+            lineas.append(sep2)
+            lineas.append(f"  IP: {ip}{geo_str}")
+            lineas.append(sep2)
+            lineas.append(f"  Total eventos    : {p['total_eventos']:,}")
+            lineas.append(f"  Período activo   : {p['primer_evento'] or '?'} → {p['ultimo_evento'] or '?'}")
+            lineas.append(f"  Días activo      : {p['num_dias']}  ({', '.join(p['dias_activo'][:14])}{'…' if len(p['dias_activo'])>14 else ''})")
+            if p["usuarios_cuentas"]:
+                lineas.append(f"  Cuentas/usuarios : {', '.join(p['usuarios_cuentas'][:10])}")
+            if p["fuentes_log"]:
+                lineas.append(f"  Ficheros de log  : {', '.join(p['fuentes_log'][:5])}")
+            # Franjas horarias
+            lineas.append(f"  Franjas horarias (UTC):")
+            lineas.append(f"    Madrugada 00-06h : {p['franja_madrugada_0_6h']:>5} eventos")
+            lineas.append(f"    Mañana    06-12h : {p['franja_manana_6_12h']:>5} eventos")
+            lineas.append(f"    Tarde     12-18h : {p['franja_tarde_12_18h']:>5} eventos")
+            lineas.append(f"    Noche     18-24h : {p['franja_noche_18_24h']:>5} eventos")
+            # Distribución por hora (gráfico ASCII)
+            dist = p["distribucion_hora_utc"]
+            max_h = max((v for v in dist.values()), default=1)
+            lineas.append("  Distribución horaria UTC:")
+            for h in range(24):
+                c = dist.get(str(h), 0)
+                bar = "█" * int(c * 25 / max_h) if max_h > 0 and c > 0 else ""
+                marker = " ◄" if c == max_h and max_h > 0 else ""
+                lineas.append(f"    {h:02d}h  {bar:<25} {c:>5}{marker}")
+            # Días de la semana
+            if p["distribucion_diasemana"]:
+                diasem_str = "  ".join(
+                    f"{d}:{c}" for d, c in p["distribucion_diasemana"].items()
+                )
+                lineas.append(f"  Actividad por día semana: {diasem_str}")
+            # Acciones
+            if p["acciones"]:
+                acc_str = ", ".join(f"{a}×{c}" for a, c in list(p["acciones"].items())[:8])
+                lineas.append(f"  Acciones         : {acc_str}")
+            # Auth
+            if p["exitos_auth"] or p["fallos_auth"]:
+                lineas.append(f"  Auth             : ✓ {p['exitos_auth']} éxitos · ✗ {p['fallos_auth']} fallos")
+            # HTTP
+            if p["exitos_http"] or p["fallos_http"]:
+                lineas.append(f"  HTTP             : 2xx={p['exitos_http']} · 4xx/5xx={p['fallos_http']}")
+            if p["bytes_total"]:
+                mb = p["bytes_total"] / 1_048_576
+                lineas.append(f"  Bytes transferidos: {mb:.1f} MB ({p['bytes_total']:,} bytes)")
+            # Rutas top
+            if p["recursos_top"]:
+                lineas.append("  Rutas más accedidas:")
+                for entry in p["recursos_top"][:10]:
+                    lineas.append(f"    ({entry['accesos']:>4}×)  {entry['ruta']}")
+
     # --- Hallazgos detallados ---
-    sec("7. HALLAZGOS DETALLADOS")
+    sec("8. HALLAZGOS DETALLADOS")
     for f in report.findings:
         subsec(f"{f.fid} [{f.severity}] — {f.title}")
         lineas.append(f"  Descripción  : {f.description}")
@@ -2813,6 +2980,18 @@ def print_summary(report: Report) -> None:
             print(f"             {ts}  IPs: {', '.join(f.ips[:3]) or '—'}")
     else:
         print("  Sin hallazgos detectados.")
+
+    if report.ip_profiles:
+        top_n = min(10, len(report.ip_profiles))
+        print(f"{'─' * 60}")
+        print(f"  IPs más activas (top {top_n} de {len(report.ip_profiles)} únicas):")
+        for ip, p in list(report.ip_profiles.items())[:top_n]:
+            dias = p['num_dias']
+            ev = p['total_eventos']
+            auth_str = f"  ✓{p['exitos_auth']}/✗{p['fallos_auth']}" if (p['exitos_auth'] or p['fallos_auth']) else ""
+            pico = max(p["distribucion_hora_utc"].items(), key=lambda x: x[1])
+            print(f"    {ip:<18} {ev:>5} eventos · {dias} día(s){auth_str}  [pico: {pico[0]}h UTC]")
+
     print(f"{'═' * 60}\n")
 
 
