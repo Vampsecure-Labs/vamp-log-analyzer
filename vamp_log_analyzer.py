@@ -88,17 +88,21 @@ import pathlib
 import re
 import statistics
 import sys
+import tempfile
 import textwrap
+import time
 import urllib.error
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from typing import Dict, Generator, Iterable, List, Optional, Tuple
 
 # ============================================================
 # VERSIÓN Y METADATOS
 # ============================================================
 
-VERSION = "2.0"
+VERSION = "2.1"
 TOOL = "vamp-log-analyzer"
 FINDING_PREFIX = "FORA"
 
@@ -366,6 +370,8 @@ class Report:
     timeline_analysis: dict = dataclasses.field(default_factory=dict)
     geoip_data: dict = dataclasses.field(default_factory=dict)
     ip_profiles: dict = dataclasses.field(default_factory=dict)  # {ip: perfil de actividad completa}
+    baseline_delta: dict = dataclasses.field(default_factory=dict)  # comparativa vs baseline (v2.1)
+    narrative: str = ""  # narrativa LLM del incidente (v2.1)
 
     @property
     def summary(self) -> dict:
@@ -1720,6 +1726,7 @@ def analyze_files(
     analyst: str = "",
     case: str = "",
     enable_geoip: bool = False,
+    scope: Optional[ScopeConfig] = None,
     session_gap_min: int = 30,
 ) -> Report:
     detector = Detector(config)
@@ -1821,6 +1828,18 @@ def analyze_files(
             geoip = GeoIPResolver.resolver(todas_ips)
             resueltas = len(geoip)
             print(f"  [✓] {resueltas} IPs geolocalizadas.", file=sys.stderr)
+
+    # Filtrado por scope: marcar hallazgos de IPs de confianza
+    if scope:
+        filtered = []
+        for f in all_findings:
+            if f.fid in scope.exclude_detectors:
+                continue
+            # Si TODAS las IPs del hallazgo son de confianza → descartar
+            if f.ips and all(scope.is_trusted(ip) for ip in f.ips):
+                continue
+            filtered.append(f)
+        all_findings = filtered
 
     return Report(
         tool=TOOL, version=VERSION,
@@ -2257,6 +2276,504 @@ class GeoIPResolver:
 
 
 # ============================================================
+# NUEVAS CAPACIDADES v2.1
+# ============================================================
+
+class ScopeConfig:
+    """Configuración del entorno del cliente para calibrar detectores."""
+
+    def __init__(self, path: str):
+        raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        self.business_start: int = raw.get("business_hours_start", 8)
+        self.business_end: int = raw.get("business_hours_end", 20)
+        self.tz_offset: int = raw.get("timezone_offset_hours", 0)
+        self.trusted_nets: List[ipaddress.IPv4Network] = []
+        for n in raw.get("trusted_ips", []):
+            try:
+                self.trusted_nets.append(ipaddress.ip_network(n, strict=False))
+            except ValueError:
+                pass
+        self.admin_ips: set = set(raw.get("admin_ips", []))
+        self.exclude_detectors: set = set(raw.get("exclude_detectors", []))
+        self.organization: str = raw.get("organization", "")
+        self.case_name: str = raw.get("case_name", "")
+        self.analyst_name: str = raw.get("analyst_name", "")
+        self.normal_peak_hour: Optional[int] = raw.get("normal_peak_hour")
+
+    def is_trusted(self, ip_str: Optional[str]) -> bool:
+        if not ip_str:
+            return False
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            return any(addr in net for net in self.trusted_nets)
+        except ValueError:
+            return False
+
+    def is_business_hour(self, hour_utc: int) -> bool:
+        h = (hour_utc + self.tz_offset) % 24
+        if self.business_start <= self.business_end:
+            return self.business_start <= h < self.business_end
+        return h >= self.business_start or h < self.business_end
+
+    @staticmethod
+    def ejemplo() -> str:
+        return json.dumps({
+            "organization": "Mi Empresa S.L.",
+            "case_name": "CASO-2026-001",
+            "analyst_name": "Nombre Apellido, Perito Informático Col. 00000",
+            "business_hours_start": 8,
+            "business_hours_end": 20,
+            "timezone_offset_hours": 1,
+            "trusted_ips": ["10.0.0.0/8", "192.168.0.0/16"],
+            "admin_ips": ["192.168.1.10", "192.168.1.11"],
+            "exclude_detectors": [],
+            "normal_peak_hour": 11,
+        }, ensure_ascii=False, indent=2)
+
+
+class BaselineProfiler:
+    """Genera y compara perfiles estadísticos de comportamiento normal."""
+
+    @staticmethod
+    def generar(report: "Report") -> dict:
+        baseline: dict = {
+            "version": "1.0",
+            "tool_version": VERSION,
+            "created": datetime.datetime.utcnow().isoformat() + "Z",
+            "sources": report.sources,
+            "total_events": report.total_events_parsed,
+            "known_ips": list(report.ip_profiles.keys()),
+            "hourly_mean": {},
+            "hourly_stdev": {},
+            "bytes_mean": 0.0,
+            "bytes_stdev": 0.0,
+            "typical_detectors": {},
+            "summary": dict(report.summary),
+        }
+        all_hourly: Dict[int, List[int]] = collections.defaultdict(list)
+        all_bytes: List[float] = []
+        for p in report.ip_profiles.values():
+            for h_str, count in p["distribucion_hora_utc"].items():
+                all_hourly[int(h_str)].append(count)
+            if p.get("bytes_total"):
+                all_bytes.append(float(p["bytes_total"]))
+        for h in range(24):
+            vals = all_hourly[h] or [0]
+            baseline["hourly_mean"][str(h)] = round(statistics.mean(vals), 2)
+            baseline["hourly_stdev"][str(h)] = round(
+                statistics.stdev(vals) if len(vals) > 1 else 0.0, 2)
+        if all_bytes:
+            baseline["bytes_mean"] = round(statistics.mean(all_bytes), 0)
+            baseline["bytes_stdev"] = round(
+                statistics.stdev(all_bytes) if len(all_bytes) > 1 else 0.0, 0)
+        for f in report.findings:
+            baseline["typical_detectors"][f.fid] = (
+                baseline["typical_detectors"].get(f.fid, 0) + 1)
+        return baseline
+
+    @staticmethod
+    def comparar(baseline: dict, report: "Report") -> dict:
+        baseline_ips = set(baseline.get("known_ips", []))
+        current_ips = set(report.ip_profiles.keys())
+        baseline_detectors = set(baseline.get("typical_detectors", {}).keys())
+        current_detectors = set(f.fid for f in report.findings)
+
+        anomalias_horarias: List[dict] = []
+        for ip, p in report.ip_profiles.items():
+            for h_str, count in p["distribucion_hora_utc"].items():
+                h = int(h_str)
+                mean = baseline["hourly_mean"].get(str(h), 0.0)
+                stdev = baseline["hourly_stdev"].get(str(h), 0.0)
+                if stdev > 0 and count > mean + 3 * stdev:
+                    anomalias_horarias.append({
+                        "ip": ip, "hora_utc": h, "eventos": count,
+                        "media_baseline": mean,
+                        "desviaciones_std": round((count - mean) / stdev, 1),
+                    })
+        anomalias_horarias.sort(key=lambda x: x["desviaciones_std"], reverse=True)
+
+        # IPs nuevas con alta actividad
+        threshold = 10
+        if report.ip_profiles:
+            max_ev = max(p["total_eventos"] for p in report.ip_profiles.values())
+            threshold = max(10, max_ev // 20)
+        ips_aumento = [
+            {"ip": ip, "eventos": p["total_eventos"],
+             "dias": p["num_dias"], "pico_hora": max(
+                 p["distribucion_hora_utc"].items(), key=lambda x: x[1])[0]}
+            for ip, p in sorted(report.ip_profiles.items(),
+                                 key=lambda x: x[1]["total_eventos"], reverse=True)
+            if ip not in baseline_ips and p["total_eventos"] >= threshold
+        ][:20]
+
+        return {
+            "baseline_created": baseline.get("created", "?"),
+            "baseline_sources": baseline.get("sources", []),
+            "nuevas_ips": sorted(current_ips - baseline_ips),
+            "ips_desaparecidas": sorted(baseline_ips - current_ips),
+            "ips_nuevas_alta_actividad": ips_aumento,
+            "nuevos_detectores": sorted(current_detectors - baseline_detectors),
+            "detectores_desaparecidos": sorted(baseline_detectors - current_detectors),
+            "anomalias_horarias": anomalias_horarias[:30],
+            "resumen_baseline": baseline.get("summary", {}),
+            "resumen_actual": dict(report.summary),
+        }
+
+
+class STIXExporter:
+    """Exporta hallazgos como bundle STIX 2.1 para MISP / OpenCTI / TheHive."""
+
+    @staticmethod
+    def exportar(report: "Report") -> str:
+        now_iso = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        def new_id(t: str) -> str:
+            return f"{t}--{uuid.uuid4()}"
+
+        objs: List[dict] = []
+
+        identity_id = new_id("identity")
+        objs.append({
+            "type": "identity", "spec_version": "2.1",
+            "id": identity_id, "created": now_iso, "modified": now_iso,
+            "name": "VampSecure Labs — vamp-log-analyzer",
+            "identity_class": "system",
+        })
+
+        # Attack-pattern objects from MITRE_MAPPING
+        fora_to_ap: Dict[str, str] = {}
+        for rule_id, mapping in MITRE_MAPPING.items():
+            ap_id = new_id("attack-pattern")
+            fora_to_ap[rule_id] = ap_id
+            tech = mapping["technique"]
+            tech_id = tech.split("—")[0].strip().split()[0] if "—" in tech else ""
+            objs.append({
+                "type": "attack-pattern", "spec_version": "2.1",
+                "id": ap_id, "created": now_iso, "modified": now_iso,
+                "name": f"{mapping['tactic']} — {tech.split('—')[0].strip()}",
+                "description": tech,
+                "external_references": [{"source_name": "mitre-attack",
+                                          "external_id": tech_id}],
+                "created_by_ref": identity_id,
+            })
+
+        # Indicator objects for public IPs with findings
+        ip_info: Dict[str, dict] = {}
+        for f in report.findings:
+            for ip in (f.ips or []):
+                cur = ip_info.get(ip, {"sev": "LOW", "rules": set(),
+                                        "internal": _ip_is_private(ip)})
+                if _severity_rank(f.severity) > _severity_rank(cur["sev"]):
+                    cur["sev"] = f.severity
+                cur["rules"].add(f.fid)
+                ip_info[ip] = cur
+
+        ip_to_ind: Dict[str, str] = {}
+        conf_map = {"CRITICAL": 90, "HIGH": 75, "MEDIUM": 50, "LOW": 30}
+        for ip, info in ip_info.items():
+            ind_id = new_id("indicator")
+            ip_to_ind[ip] = ind_id
+            valid_from = report.time_range_start or now_iso
+            scope_note = " [IP interna/privada]" if info.get("internal") else ""
+            objs.append({
+                "type": "indicator", "spec_version": "2.1",
+                "id": ind_id, "created": now_iso, "modified": now_iso,
+                "name": f"IP sospechosa: {ip}{scope_note}",
+                "description": (f"Severidad máxima: {info['sev']}. "
+                                f"Detectores: {', '.join(sorted(info['rules']))}"),
+                "pattern": f"[ipv4-addr:value = '{ip}']",
+                "pattern_type": "stix",
+                "valid_from": valid_from,
+                "indicator_types": ["malicious-activity"],
+                "confidence": conf_map.get(info["sev"], 50),
+                "created_by_ref": identity_id,
+            })
+
+        # Observed-data object
+        obs_id = new_id("observed-data")
+        objs.append({
+            "type": "observed-data", "spec_version": "2.1",
+            "id": obs_id, "created": now_iso, "modified": now_iso,
+            "first_observed": report.time_range_start or now_iso,
+            "last_observed": report.time_range_end or now_iso,
+            "number_observed": report.total_events_parsed,
+            "object_refs": list(ip_to_ind.values())[:200],
+            "created_by_ref": identity_id,
+        })
+
+        # Relationships: indicator → attack-pattern (deduplicadas)
+        seen_rels: set = set()
+        for f in report.findings:
+            if f.fid not in fora_to_ap:
+                continue
+            ap_id = fora_to_ap[f.fid]
+            for ip in (f.ips or []):
+                if ip not in ip_to_ind:
+                    continue
+                key = (ip_to_ind[ip], ap_id)
+                if key in seen_rels:
+                    continue
+                seen_rels.add(key)
+                objs.append({
+                    "type": "relationship", "spec_version": "2.1",
+                    "id": new_id("relationship"),
+                    "created": now_iso, "modified": now_iso,
+                    "relationship_type": "indicates",
+                    "source_ref": ip_to_ind[ip],
+                    "target_ref": ap_id,
+                    "created_by_ref": identity_id,
+                })
+
+        bundle = {
+            "type": "bundle",
+            "id": new_id("bundle"),
+            "spec_version": "2.1",
+            "objects": objs,
+        }
+        return json.dumps(bundle, ensure_ascii=False, indent=2)
+
+
+class EvidencePackager:
+    """Empaqueta evidencias en un ZIP sellado con SHA-256 (apto para peritaje)."""
+
+    @staticmethod
+    def empaquetar(
+        log_paths: List[str],
+        report: "Report",
+        output_zip: str,
+        *,
+        forensic_txt: str = "",
+        ioc_csv: str = "",
+        stix_json: str = "",
+        analysis_json: str = "",
+    ) -> str:
+        manifest: List[str] = [
+            "# MANIFEST SHA-256 — VampSecure Labs — vamp-log-analyzer",
+            f"# Generado     : {datetime.datetime.utcnow().isoformat()}Z",
+            f"# Herramienta  : vamp-log-analyzer v{VERSION}",
+            f"# Caso         : {report.chain_of_custody.get('case', 'N/D')}",
+            f"# Analista     : {report.chain_of_custody.get('analyst', 'N/D')}",
+            "",
+        ]
+
+        def sha256b(data: bytes) -> str:
+            return hashlib.sha256(data).hexdigest()
+
+        with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # Ficheros de log originales
+            for path in log_paths:
+                p = pathlib.Path(path)
+                if not p.is_file():
+                    continue
+                data = p.read_bytes()
+                arc = f"evidencias/{p.name}"
+                zf.writestr(arc, data)
+                manifest.append(f"{sha256b(data)}  {arc}")
+
+            # Informes generados
+            reports_to_add = [
+                ("informes/informe_forense.txt", forensic_txt),
+                ("informes/iocs.csv", ioc_csv),
+                ("informes/hallazgos.stix.json", stix_json),
+                ("informes/analisis.json", analysis_json),
+            ]
+            for arc, content in reports_to_add:
+                if not content:
+                    continue
+                data = content.encode("utf-8")
+                zf.writestr(arc, data)
+                manifest.append(f"{sha256b(data)}  {arc}")
+
+            # Cadena de custodia
+            coc_data = json.dumps(
+                report.chain_of_custody, ensure_ascii=False, indent=2
+            ).encode("utf-8")
+            zf.writestr("cadena_de_custodia.json", coc_data)
+            manifest.append(f"{sha256b(coc_data)}  cadena_de_custodia.json")
+
+            # Manifiesto final (auto-incluido)
+            manifest_txt = "\n".join(manifest) + "\n"
+            zf.writestr("MANIFEST.sha256", manifest_txt.encode("utf-8"))
+
+        return output_zip
+
+
+class NarrativeGenerator:
+    """Genera narrativa forense en español usando LLM (Ollama o Claude API)."""
+
+    @staticmethod
+    def _prompt(report: "Report") -> str:
+        s = report.summary
+        top_ips = list(report.ip_profiles.items())[:5]
+        ip_lines = []
+        for ip, p in top_ips:
+            pico = max(p["distribucion_hora_utc"].items(), key=lambda x: x[1])
+            ip_lines.append(
+                f"  - {ip}: {p['total_eventos']} eventos, "
+                f"{p['num_dias']} día(s), pico {pico[0]}h UTC, "
+                f"franjas: madrugada {p['franja_madrugada_0_6h']} / "
+                f"mañana {p['franja_manana_6_12h']} / "
+                f"tarde {p['franja_tarde_12_18h']} / noche {p['franja_noche_18_24h']}"
+            )
+        top_f = sorted(report.findings,
+                       key=lambda f: _severity_rank(f.severity), reverse=True)[:6]
+        f_lines = [f"  - {f.fid} [{f.severity}]: {f.title}" for f in top_f]
+        return (
+            "Eres un perito informático forense experto en España. Redacta en español "
+            "un párrafo narrativo técnico-jurídico de 180-280 palabras que describa el "
+            "incidente de seguridad detectado. Usa lenguaje formal y preciso, apto para "
+            "un informe pericial judicial. Sin listas ni viñetas. Incluye: período del "
+            "incidente, patrones de actividad de las IPs más relevantes (franjas horarias, "
+            "días activos), tipos de ataques o anomalías detectados y valoración de gravedad.\n\n"
+            f"Período analizado : {report.time_range_start} → {report.time_range_end}\n"
+            f"Eventos totales   : {report.total_events_parsed:,}\n"
+            f"Hallazgos         : {s['total']} "
+            f"({s['critical']} CRITICAL / {s['high']} HIGH / "
+            f"{s['medium']} MEDIUM / {s['low']} LOW)\n"
+            f"Fuentes de log    : {', '.join(report.sources)}\n\n"
+            f"IPs más activas:\n{chr(10).join(ip_lines) or '  (sin datos de IP)'}\n\n"
+            f"Hallazgos más graves:\n{chr(10).join(f_lines) or '  (sin hallazgos)'}\n\n"
+            "Escribe SOLO el párrafo narrativo, sin títulos ni encabezados."
+        )
+
+    @staticmethod
+    def ollama(report: "Report", model: str = "llama3.2:3b",
+               host: str = "http://127.0.0.1:11434") -> str:
+        payload = json.dumps({
+            "model": model,
+            "prompt": NarrativeGenerator._prompt(report),
+            "stream": False,
+            "options": {"temperature": 0.25, "num_predict": 500},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{host}/api/generate", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read()).get("response", "").strip()
+        except Exception as exc:
+            return f"[Narrativa Ollama — error: {exc}]"
+
+    @staticmethod
+    def claude(report: "Report", api_key: str,
+               model: str = "claude-haiku-4-5-20251001") -> str:
+        payload = json.dumps({
+            "model": model,
+            "max_tokens": 600,
+            "messages": [{"role": "user",
+                           "content": NarrativeGenerator._prompt(report)}],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages", data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+                return data["content"][0]["text"].strip()
+        except Exception as exc:
+            return f"[Narrativa Claude — error: {exc}]"
+
+
+class StreamingAnalyzer:
+    """Monitorización en tiempo real de un log que crece (modo tail -f)."""
+
+    COLORS = {
+        "CRITICAL": "\033[1;37;41m", "HIGH": "\033[1;31m",
+        "MEDIUM": "\033[1;33m", "LOW": "\033[1;36m",
+    }
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+
+    def __init__(self, path: str, log_type: str, config: dict,
+                 min_severity: str = "MEDIUM", interval: float = 1.0):
+        self.path = path
+        self.log_type = log_type
+        self.config = config
+        self.min_severity = min_severity
+        self.interval = interval
+        self._seen: set = set()
+
+    def seguir(self) -> None:
+        ltype = (self.log_type if self.log_type != "auto"
+                 else detect_log_type(self.path))
+        parser = get_parser(ltype)
+        detector = Detector(self.config)
+        total_ev = 0
+
+        print(f"\n{self.BOLD}[STREAM]{self.RESET} "
+              f"Monitorizando: {self.path}  (tipo: {ltype})")
+        print(f"         Umbral: {self.min_severity} | "
+              f"Intervalo: {self.interval}s | Ctrl+C para detener\n")
+
+        try:
+            last_pos = pathlib.Path(self.path).stat().st_size
+        except FileNotFoundError:
+            print(f"[!] Fichero no encontrado: {self.path}", file=sys.stderr)
+            return
+
+        try:
+            while True:
+                time.sleep(self.interval)
+                try:
+                    cur_size = pathlib.Path(self.path).stat().st_size
+                except OSError:
+                    continue
+                if cur_size <= last_pos:
+                    continue
+
+                with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(last_pos)
+                    new_content = fh.read()
+                last_pos = cur_size
+
+                if not new_content.strip():
+                    continue
+
+                # Parsear nuevas líneas vía fichero temporal
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".{ltype}.log")
+                try:
+                    os.write(tmp_fd, new_content.encode("utf-8", errors="replace"))
+                    os.close(tmp_fd)
+                    for event in parser(tmp_path):
+                        total_ev += 1
+                        self._emit(detector.process(event))
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        except KeyboardInterrupt:
+            print(f"\n{self.BOLD}[STREAM]{self.RESET} "
+                  f"Detenido. {total_ev} eventos procesados.")
+            final = detector.finalize()
+            if final:
+                print("\n[*] Hallazgos consolidados al cierre:")
+                self._emit(final, force=True)
+
+    def _emit(self, findings: List["Finding"], force: bool = False) -> None:
+        min_rank = _severity_rank(self.min_severity)
+        for f in findings:
+            if _severity_rank(f.severity) < min_rank and not force:
+                continue
+            key = (f.fid, f.title, tuple(sorted(f.ips or [])))
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            ts = datetime.datetime.utcnow().strftime("%H:%M:%S")
+            color = self.COLORS.get(f.severity, "")
+            ips_str = f"  ↳ IPs: {', '.join(f.ips[:5])}" if f.ips else ""
+            print(f"[{ts}] {color}{f.severity:<8}{self.RESET} "
+                  f"{f.fid}  {f.title}")
+            if ips_str:
+                print(ips_str)
+
+
+# ============================================================
 # GENERACIÓN DE INFORMES
 # ============================================================
 
@@ -2499,8 +3016,21 @@ def to_forensic_txt(report: Report) -> str:
                 for entry in p["recursos_top"][:10]:
                     lineas.append(f"    ({entry['accesos']:>4}×)  {entry['ruta']}")
 
+    # --- Baseline delta ---
+    if report.baseline_delta:
+        sec("8. ANÁLISIS DIFERENCIAL CONTRA BASELINE")
+        lineas.append(to_baseline_delta_txt(report.baseline_delta))
+
+    # --- Narrativa LLM ---
+    if report.narrative:
+        sec("9. NARRATIVA DEL INCIDENTE (GENERADA POR IA)")
+        for linea in textwrap.wrap(report.narrative, width=72):
+            lineas.append(f"  {linea}")
+        lineas.append("")
+
     # --- Hallazgos detallados ---
-    sec("8. HALLAZGOS DETALLADOS")
+    n_sec = 10 if (report.baseline_delta or report.narrative) else 8
+    sec(f"{n_sec}. HALLAZGOS DETALLADOS")
     for f in report.findings:
         subsec(f"{f.fid} [{f.severity}] — {f.title}")
         lineas.append(f"  Descripción  : {f.description}")
@@ -2571,6 +3101,77 @@ def to_ioc_csv(report: Report) -> str:
         ])
 
     return buf.getvalue()
+
+
+def to_stix(report: Report) -> str:
+    """Exporta hallazgos como STIX 2.1 bundle (delegado a STIXExporter)."""
+    return STIXExporter.exportar(report)
+
+
+def to_baseline_delta_txt(delta: dict) -> str:
+    """Genera texto legible de la comparativa contra baseline."""
+    lines = [
+        "=" * 72,
+        "ANÁLISIS DIFERENCIAL — COMPARATIVA CONTRA BASELINE",
+        "=" * 72,
+        f"Baseline creado : {delta.get('baseline_created', 'N/D')}",
+        f"Fuentes baseline: {', '.join(delta.get('baseline_sources', []))}",
+        "",
+    ]
+    def section(title: str, items: list, fmt=str):
+        lines.append(f"  {title}:")
+        if items:
+            for it in items:
+                lines.append(f"    • {fmt(it)}")
+        else:
+            lines.append("    (ninguno)")
+        lines.append("")
+
+    section("IPs NUEVAS (no vistas en baseline)",
+            delta.get("nuevas_ips", []))
+    section("IPs DESAPARECIDAS (presentes en baseline, no ahora)",
+            delta.get("ips_desaparecidas", []))
+
+    act = delta.get("ips_nuevas_alta_actividad", [])
+    if act:
+        lines.append("  IPs NUEVAS CON ALTA ACTIVIDAD:")
+        for x in act:
+            lines.append(
+                f"    • {x['ip']:<18} {x['eventos']:>6} eventos "
+                f"| {x['dias']} día(s) | pico {x.get('pico_hora', '?')}h UTC")
+        lines.append("")
+
+    section("DETECTORES NUEVOS (no disparados en baseline)",
+            delta.get("nuevos_detectores", []))
+    section("DETECTORES DESAPARECIDOS (presentes en baseline, no ahora)",
+            delta.get("detectores_desaparecidos", []))
+
+    anom = delta.get("anomalias_horarias", [])
+    if anom:
+        lines.append("  ANOMALÍAS HORARIAS (>3σ respecto baseline):")
+        for a in anom[:15]:
+            lines.append(
+                f"    • {a['ip']:<18} hora {a['hora_utc']:02d}h UTC "
+                f"→ {a['eventos']} ev  (media baseline: {a['media_baseline']}, "
+                f"+{a['desviaciones_std']}σ)")
+        lines.append("")
+
+    lines += [
+        "  RESUMEN COMPARATIVO:",
+        "  " + "-" * 50,
+    ]
+    rb = delta.get("resumen_baseline", {})
+    ra = delta.get("resumen_actual", {})
+    for sev in ("critical", "high", "medium", "low"):
+        b = rb.get(sev, 0)
+        a = ra.get(sev, 0)
+        diff = a - b
+        arrow = ("▲" if diff > 0 else "▼" if diff < 0 else "═")
+        lines.append(
+            f"  {sev.upper():<8}  baseline: {b:>4}  actual: {a:>4}  "
+            f"{arrow} {abs(diff):+d}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _sev_color(sev: str) -> str:
@@ -2945,7 +3546,14 @@ def resolve_paths(inputs: List[str]) -> List[str]:
     return out
 
 
-def build_config(args) -> dict:
+def build_config(args, scope: Optional[ScopeConfig] = None) -> dict:
+    night_from = args.night_from
+    night_to = args.night_to
+    # El scope sobrescribe el horario nocturno si está definido
+    if scope:
+        # "horario anómalo" = fuera del horario laboral del scope
+        night_from = scope.business_end % 24
+        night_to = scope.business_start
     return {
         "large_response":       args.large_response_mb * 1024 * 1024,
         "brute_window_sec":     args.brute_window,
@@ -2953,7 +3561,7 @@ def build_config(args) -> dict:
         "brute_threshold_web":  args.brute_web,
         "spray_users_min":      args.spray_min_users,
         "dir_enum_threshold":   args.dir_enum,
-        "unusual_hours":        (args.night_from, args.night_to),
+        "unusual_hours":        (night_from, night_to),
         "top_n":                args.top_n,
     }
 
@@ -3010,7 +3618,7 @@ def main() -> int:
           %(prog)s security.xml --type windows --report-html windows_audit.html
         """),
     )
-    parser.add_argument("paths", nargs="+", help="Ficheros o directorios de log a analizar")
+    parser.add_argument("paths", nargs="*", help="Ficheros o directorios de log a analizar")
     parser.add_argument("--type", default="auto",
                         choices=["auto","web","iis","db_mysql","db_postgres","db_mongo",
                                  "linux_auth","linux_sys","windows","macos","generic"],
@@ -3051,8 +3659,61 @@ def main() -> int:
     parser.add_argument("--night-from",     type=int, default=0,    metavar="H",  help="Inicio de horario nocturno anómalo UTC (default: 0)")
     parser.add_argument("--night-to",       type=int, default=6,    metavar="H",  help="Fin de horario nocturno anómalo UTC (default: 6)")
     parser.add_argument("--verbose", "-v",  action="store_true",    help="Modo detallado")
+    # v2.1 — Diferenciación de mercado
+    parser.add_argument("--scope", metavar="FICHERO.json",
+                        help="Fichero de configuración del entorno (horas laborales, IPs de confianza, etc.)")
+    parser.add_argument("--scope-example", action="store_true",
+                        help="Mostrar ejemplo de fichero scope.json y salir")
+    parser.add_argument("--stix", metavar="FICHERO.json", dest="stix_file",
+                        help="Exportar hallazgos como bundle STIX 2.1 (para MISP/OpenCTI/TheHive)")
+    parser.add_argument("--package", metavar="FICHERO.zip", dest="package_file",
+                        help="Empaquetar evidencias + informes en ZIP sellado con SHA-256")
+    parser.add_argument("--learn", metavar="BASELINE.json", dest="learn_file",
+                        help="Generar perfil estadístico de comportamiento normal y guardarlo")
+    parser.add_argument("--baseline", metavar="BASELINE.json", dest="baseline_file",
+                        help="Comparar análisis actual contra un baseline previo (generado con --learn)")
+    parser.add_argument("--narrative", choices=["ollama", "claude"], metavar="MOTOR",
+                        help="Generar narrativa forense en español con LLM (ollama|claude)")
+    parser.add_argument("--narrative-model", metavar="MODELO", default="llama3.2:3b",
+                        help="Modelo LLM para la narrativa (default: llama3.2:3b con Ollama)")
+    parser.add_argument("--narrative-host", metavar="URL", default="http://127.0.0.1:11434",
+                        help="Host Ollama (default: http://127.0.0.1:11434)")
+    parser.add_argument("--claude-api-key", metavar="KEY", default="",
+                        help="API key de Anthropic para narrativa con Claude")
+    parser.add_argument("--follow", metavar="FICHERO",
+                        help="Modo streaming: monitorizar fichero en tiempo real (tail -f)")
 
     args = parser.parse_args()
+
+    # --- Modo --scope-example ---
+    if getattr(args, "scope_example", False):
+        print(ScopeConfig.ejemplo())
+        return 0
+
+    # --- Sin argumentos ---
+    if not args.paths and not getattr(args, "follow", None):
+        parser.print_help()
+        return 0
+
+    # --- Modo --follow (streaming, no necesita paths obligatorios) ---
+    if getattr(args, "follow", None):
+        scope: Optional[ScopeConfig] = None
+        if getattr(args, "scope", None):
+            try:
+                scope = ScopeConfig(args.scope)
+            except Exception as e:
+                print(f"[!] Error cargando scope: {e}", file=sys.stderr)
+                return 2
+        cfg = build_config(args, scope)
+        sa = StreamingAnalyzer(
+            path=args.follow,
+            log_type=args.type,
+            config=cfg,
+            min_severity=args.min_severity,
+            interval=1.0,
+        )
+        sa.seguir()
+        return 0
 
     # Resolución de fechas
     time_from = time_to = None
@@ -3074,15 +3735,30 @@ def main() -> int:
     if args.verbose:
         print(f"[*] Analizando {len(paths)} fichero(s)...", file=sys.stderr)
 
+    # Carga de scope
+    scope = None
+    if getattr(args, "scope", None):
+        try:
+            scope = ScopeConfig(args.scope)
+            print(f"[*] Scope cargado: {args.scope} "
+                  f"(org: {scope.organization or 'N/D'}, "
+                  f"horario: {scope.business_start}h-{scope.business_end}h, "
+                  f"IPs de confianza: {len(scope.trusted_nets)})",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"[!] Error cargando scope: {e}", file=sys.stderr)
+            return 2
+
     # Análisis
-    config = build_config(args)
+    config = build_config(args, scope)
     report = analyze_files(
         paths, args.type, time_from, time_to, config, args.verbose,
         chain_of_custody=args.chain_of_custody,
-        analyst=args.analyst,
-        case=args.case,
+        analyst=(args.analyst or (scope.analyst_name if scope else "")),
+        case=(args.case or (scope.case_name if scope else "")),
         enable_geoip=args.geoip,
         session_gap_min=args.session_gap,
+        scope=scope,
     )
 
     # Filtrar por severidad mínima
@@ -3117,6 +3793,72 @@ def main() -> int:
         out = pathlib.Path(args.ioc_csv)
         out.write_text(to_ioc_csv(report), encoding="utf-8")
         print(f"[✓] IOCs CSV guardado en: {out}", file=sys.stderr)
+        alguno_guardado = True
+
+    # v2.1 — Comparativa baseline
+    if getattr(args, "baseline_file", None):
+        try:
+            bl = json.loads(pathlib.Path(args.baseline_file).read_text(encoding="utf-8"))
+            report.baseline_delta = BaselineProfiler.comparar(bl, report)
+            print("\n" + to_baseline_delta_txt(report.baseline_delta))
+        except Exception as e:
+            print(f"[!] Error cargando baseline: {e}", file=sys.stderr)
+
+    # v2.1 — Guardar baseline
+    if getattr(args, "learn_file", None):
+        bl_data = BaselineProfiler.generar(report)
+        pathlib.Path(args.learn_file).write_text(
+            json.dumps(bl_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[✓] Baseline guardado en: {args.learn_file}", file=sys.stderr)
+        alguno_guardado = True
+
+    # v2.1 — Narrativa LLM
+    if getattr(args, "narrative", None):
+        print("[*] Generando narrativa forense con IA...", file=sys.stderr)
+        if args.narrative == "ollama":
+            report.narrative = NarrativeGenerator.ollama(
+                report, model=args.narrative_model, host=args.narrative_host)
+        else:
+            api_key = args.claude_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                print("[!] --claude-api-key o variable ANTHROPIC_API_KEY requerida",
+                      file=sys.stderr)
+            else:
+                report.narrative = NarrativeGenerator.claude(
+                    report, api_key=api_key, model="claude-haiku-4-5-20251001")
+        if report.narrative and not report.narrative.startswith("["):
+            print(f"\n{'─' * 60}")
+            print("  NARRATIVA DEL INCIDENTE:")
+            print(f"{'─' * 60}")
+            for linea in textwrap.wrap(report.narrative, width=72):
+                print(f"  {linea}")
+            print(f"{'─' * 60}\n")
+
+    # v2.1 — Exportar STIX 2.1
+    stix_content = ""
+    if getattr(args, "stix_file", None):
+        stix_content = to_stix(report)
+        pathlib.Path(args.stix_file).write_text(stix_content, encoding="utf-8")
+        print(f"[✓] STIX 2.1 bundle guardado en: {args.stix_file}", file=sys.stderr)
+        alguno_guardado = True
+
+    # v2.1 — Empaquetar evidencias
+    if getattr(args, "package_file", None):
+        print("[*] Generando paquete de evidencias...", file=sys.stderr)
+        # Asegurar que tengamos el forense TXT y JSON para incluir
+        forensic_content = to_forensic_txt(report)
+        ioc_content = to_ioc_csv(report)
+        json_content = to_json(report)
+        if not stix_content:
+            stix_content = to_stix(report)
+        EvidencePackager.empaquetar(
+            paths, report, args.package_file,
+            forensic_txt=forensic_content,
+            ioc_csv=ioc_content,
+            stix_json=stix_content,
+            analysis_json=json_content,
+        )
+        print(f"[✓] Paquete de evidencias guardado en: {args.package_file}", file=sys.stderr)
         alguno_guardado = True
 
     if not alguno_guardado:
