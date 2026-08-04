@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+*.key
+*.pem
+*.log
+*.xml
+*.json
+!requirements*.txt
+venv/
+.venv/
+dist/
+build/
+*.egg-info/

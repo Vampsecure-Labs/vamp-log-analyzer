@@ -1,0 +1,10 @@
+# vamp-log-analyzer — Dependencias
+# La herramienta usa únicamente la librería estándar de Python 3.8+.
+# No se requiere instalación adicional de paquetes de terceros.
+#
+# Opcional: para soporte de gzip ya incluido (gzip module, stdlib)
+# Opcional: para parseo XML ya incluido (xml.etree.ElementTree, stdlib)
+# Opcional: para CSV ya incluido (csv module, stdlib)
+#
+# Si quieres mejorar la detección de codificación en logs no UTF-8:
+# chardet>=5.0.0
