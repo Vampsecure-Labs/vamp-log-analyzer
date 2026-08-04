@@ -1076,6 +1076,10 @@ class Detector:
         self._beacon_track: Dict[tuple, List[datetime.datetime]] = collections.defaultdict(list)
         # FORA-024: slow drip — {ip: [eventos de fallo SSH en ventana 6h]}
         self._slow_drip: Dict[str, List[LogEvent]] = collections.defaultdict(list)
+        # FORA-015: actividad nocturna — {ip_o_anon: [eventos nocturnos]}
+        self._night_events: Dict[str, List[LogEvent]] = collections.defaultdict(list)
+        # Correlación total por IP — todos los eventos, para contexto forense
+        self._ip_all_events: Dict[str, List[LogEvent]] = collections.defaultdict(list)
 
     def _fid(self, n: int) -> str:
         self._finding_counter[n] += 1
@@ -1154,6 +1158,17 @@ class Detector:
                     "Implementar rate limiting y bloqueo temporal por IP en el servidor web. "
                     "Revisar si el recurso objetivo tiene autenticación débil.",
                 ))
+
+        # --- Correlación global por IP (para contexto forense de FORA-015 y otros) ---
+        if event.ip:
+            self._ip_all_events[event.ip].append(event)
+
+        # --- FORA-015: acumulación actividad nocturna por IP ---
+        if event.timestamp:
+            h = event.timestamp.hour
+            if self.c["unusual_hours"][0] <= h < self.c["unusual_hours"][1]:
+                clave = event.ip if event.ip else "__sin_ip__"
+                self._night_events[clave].append(event)
 
         # --- FORA-022: tracking credential stuffing ---
         if event.action in ("SSH_OK", "SSH_FAIL") and event.user and event.ip:
@@ -1422,23 +1437,6 @@ class Detector:
                 "Usar cuentas con sudo para administración.",
             ))
 
-        # --- Actividad nocturna anómala ---
-        if event.timestamp:
-            h = event.timestamp.hour
-            if (self.c["unusual_hours"][0] <= h < self.c["unusual_hours"][1]
-                    and event.action not in ("INFO", "LOG", "404")):
-                findings.append(self._make_finding(
-                    15, "LOW",
-                    f"Actividad en horario nocturno ({event.timestamp.strftime('%H:%M')} UTC)",
-                    f"Evento de tipo {event.action} registrado entre las "
-                    f"{self.c['unusual_hours'][0]}h y {self.c['unusual_hours'][1]}h UTC. "
-                    f"IP: {event.ip or '—'}  Usuario: {event.user or '—'}",
-                    "Comportamiento anómalo",
-                    [event],
-                    "Verificar si la actividad era esperada (mantenimiento, backup, etc.). "
-                    "Correlacionar con otros eventos del mismo IP/usuario.",
-                ))
-
         # --- Windows: comandos sospechosos ---
         if event.log_type == "windows":
             raw_combined = (event.resource or "") + (event.raw or "")
@@ -1530,6 +1528,75 @@ class Detector:
                         "Revisar si alguna cuenta fue comprometida. "
                         "Implementar MFA para todos los usuarios.",
                     ))
+
+        # --- FORA-015: Actividad nocturna consolidada por IP ---
+        h0, h1 = self.c["unusual_hours"]
+        for ip_clave, eventos_noche in self._night_events.items():
+            if not eventos_noche:
+                continue
+            ip_real = ip_clave if ip_clave != "__sin_ip__" else None
+
+            # Estadísticas de los eventos nocturnos de este IP
+            total_noche = len(eventos_noche)
+            primer_ev = min((e.timestamp for e in eventos_noche if e.timestamp), default=None)
+            ultimo_ev = max((e.timestamp for e in eventos_noche if e.timestamp), default=None)
+
+            # Acciones distintas (excluyendo None)
+            acciones = collections.Counter(
+                e.action for e in eventos_noche if e.action and e.action not in ("INFO", "LOG")
+            )
+            # Recursos más accedidos
+            recursos = collections.Counter(
+                (e.resource or "")[:80] for e in eventos_noche if e.resource
+            )
+            # Códigos de estado / éxitos-fallos
+            status_counts = collections.Counter(e.status for e in eventos_noche if e.status)
+            exitos = sum(c for s, c in status_counts.items() if isinstance(s, int) and 200 <= s < 300)
+            fallos = sum(c for s, c in status_counts.items() if isinstance(s, int) and s >= 400)
+
+            # Correlación global del IP en todo el log (no solo nocturnos)
+            todos_ip = self._ip_all_events.get(ip_real or "", [])
+            total_ip_global = len(todos_ip)
+            horas_ip = sorted({e.timestamp.hour for e in todos_ip if e.timestamp})
+            acc_global = collections.Counter(
+                e.action for e in todos_ip if e.action and e.action not in ("INFO", "LOG")
+            )
+
+            # Construir descripción detallada
+            acciones_str = ", ".join(f"{a}×{c}" for a, c in acciones.most_common(6)) or "genérica"
+            recursos_top = "; ".join(r for r, _ in recursos.most_common(5)) if recursos else "—"
+            horas_str = ", ".join(f"{h}h" for h in horas_ip) if horas_ip else "solo horario nocturno"
+            acc_global_str = ", ".join(f"{a}×{c}" for a, c in acc_global.most_common(5)) or "—"
+
+            descripcion = (
+                f"IP {ip_real or '(sin IP)'} generó {total_noche} eventos entre las {h0}h y {h1}h UTC.\n"
+                f"Período nocturno: {primer_ev.strftime('%Y-%m-%d %H:%M') if primer_ev else '?'} → "
+                f"{ultimo_ev.strftime('%H:%M') if ultimo_ev else '?'} UTC.\n"
+                f"Tipos de acción nocturnos: {acciones_str}.\n"
+            )
+            if exitos or fallos:
+                descripcion += f"Éxitos HTTP: {exitos} | Fallos HTTP: {fallos}.\n"
+            if recursos:
+                descripcion += f"Recursos más accedidos: {recursos_top}.\n"
+            descripcion += (
+                f"\nCORRELACIÓN GLOBAL: {total_ip_global} eventos totales de este IP en todo el log. "
+                f"Horas activas: {horas_str}. "
+                f"Acciones totales: {acc_global_str}."
+            )
+
+            usuarios_noche = sorted({e.user for e in eventos_noche if e.user})
+
+            self._findings_raw.append(self._make_finding(
+                15, "LOW",
+                f"Actividad nocturna ({total_noche} eventos, {h0}h-{h1}h UTC) desde {ip_real or 'IP desconocida'}",
+                descripcion,
+                "Comportamiento anómalo — Horario inusual",
+                eventos_noche[:50],
+                "Verificar si la actividad nocturna era esperada (mantenimiento, batch jobs, backup). "
+                "Revisar si el acceso fue autorizado. "
+                "Si es tráfico de aplicación legítimo fuera de horario, ajustar el umbral con --night-from/--night-to. "
+                "Si el IP no es reconocido, investigar su origen y bloquear si procede.",
+            ))
 
         # --- FORA-022: Credential stuffing ---
         # Patrón: múltiples IPs distintas fallan con el mismo usuario → luego una IP tiene éxito
