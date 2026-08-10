@@ -1326,16 +1326,46 @@ class Detector:
             ))
 
         # --- Acceso a ficheros sensibles ---
+        # La severidad depende del RESULTADO: un 200 = el fichero se sirvió (exposición real);
+        # un 403/404/301… = un escáner probó suerte y el servidor lo rechazó (ruido de fondo,
+        # constante en cualquier web pública). Sin esta distinción la regla llena de falsos
+        # positivos porque los bots sondean /.env en todo internet a todas horas.
         if RE_SENSITIVE_FILES.search(event.resource or ""):
-            findings.append(self._make_finding(
-                19, "HIGH",
-                f"Acceso a fichero sensible desde {event.ip or 'IP desconocida'}",
-                f"Petición a fichero de configuración o credenciales: {event.resource or ''}",
-                "Descubrimiento / Acceso a archivos",
-                [event],
-                "Verificar si el acceso fue exitoso. Rotar credenciales si el fichero contiene secretos. "
-                "Bloquear acceso web a ficheros de configuración con .htaccess o reglas nginx.",
-            ))
+            st = event.status
+            if st in (200, 206):
+                findings.append(self._make_finding(
+                    19, "CRITICAL",
+                    f"FICHERO SENSIBLE SERVIDO (HTTP {st}) a {event.ip or 'IP desconocida'}",
+                    f"El servidor DEVOLVIÓ (status {st}) un fichero de configuración/credenciales: "
+                    f"{event.resource or ''}. Posible fuga real de secretos.",
+                    "Descubrimiento / Acceso a archivos",
+                    [event],
+                    "URGENTE: confirmar qué se sirvió realmente; si contiene secretos, ROTARLOS ya y "
+                    "bloquear el acceso web al fichero (deny de dotfiles en nginx). NOTA: una SPA con "
+                    "fallback a index.html también responde 200 a /.env sin exponer nada — verificar "
+                    "el cuerpo antes de dar por cierta la fuga.",
+                ))
+            elif st in (301, 302, 400, 401, 403, 404, 405, 410, 444):
+                findings.append(self._make_finding(
+                    19, "INFO",
+                    f"Sondeo de fichero sensible (bloqueado, HTTP {st}) desde {event.ip or 'IP desconocida'}",
+                    f"Un escáner pidió {event.resource or ''} y el servidor lo rechazó (status {st}). "
+                    "Ruido de fondo habitual de internet; no hubo exposición.",
+                    "Descubrimiento / Acceso a archivos",
+                    [event],
+                    "No requiere acción inmediata. Mantener el bloqueo de dotfiles en nginx. Si el "
+                    "volumen desde una misma IP es alto, valorar fail2ban/CrowdSec para banearla.",
+                ))
+            else:
+                findings.append(self._make_finding(
+                    19, "MEDIUM",
+                    f"Acceso a fichero sensible desde {event.ip or 'IP desconocida'} (status {st if st is not None else '?'})",
+                    f"Petición a fichero de configuración o credenciales: {event.resource or ''}",
+                    "Descubrimiento / Acceso a archivos",
+                    [event],
+                    "Verificar si el acceso fue exitoso. Rotar credenciales si el fichero contiene secretos. "
+                    "Bloquear acceso web a ficheros de configuración con reglas nginx.",
+                ))
 
         # --- Transferencia de datos anormalmente grande ---
         if event.bytes_out and event.bytes_out > self.c["large_response"]:
