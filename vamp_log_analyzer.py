@@ -1087,6 +1087,11 @@ class Detector:
         self._night_events: Dict[str, List[LogEvent]] = collections.defaultdict(list)
         # Correlación total por IP — todos los eventos, para contexto forense
         self._ip_all_events: Dict[str, List[LogEvent]] = collections.defaultdict(list)
+        # FORA-019: detección de cáscara de SPA (index.html servido como fallback a sondeos de
+        # ficheros). Si el 200 a un fichero sensible mide lo mismo que la raíz "/" de esa IP, o que
+        # otros ficheros sondeados por ella, no es una fuga: es el index.html de una SPA.
+        self._root200_sizes: Dict[str, set] = collections.defaultdict(set)                       # ip -> tamaños de 200 a "/"
+        self._sens200_sizes: Dict[str, "collections.Counter"] = collections.defaultdict(collections.Counter)  # ip -> Counter(tamaño)
 
     def _fid(self, n: int) -> str:
         self._finding_counter[n] += 1
@@ -1325,6 +1330,13 @@ class Detector:
                 "Eliminar instalaciones de administración innecesarias.",
             ))
 
+        # Registrar el tamaño de las respuestas 200 a la raíz "/" por IP (para detectar la cáscara
+        # de una SPA: si un fichero sensible se sirve con 200 del mismo tamaño que "/", es el index.html).
+        _rq = (event.resource or "").split()
+        _path = (_rq[1] if len(_rq) >= 2 else (event.resource or "")).split("?")[0]
+        if event.status in (200, 206) and _path in ("/", "/index.html") and event.bytes_out:
+            self._root200_sizes[event.ip or "?"].add(event.bytes_out)
+
         # --- Acceso a ficheros sensibles ---
         # La severidad depende del RESULTADO: un 200 = el fichero se sirvió (exposición real);
         # un 403/404/301… = un escáner probó suerte y el servidor lo rechazó (ruido de fondo,
@@ -1333,18 +1345,38 @@ class Detector:
         if RE_SENSITIVE_FILES.search(event.resource or ""):
             st = event.status
             if st in (200, 206):
-                findings.append(self._make_finding(
-                    19, "CRITICAL",
-                    f"FICHERO SENSIBLE SERVIDO (HTTP {st}) a {event.ip or 'IP desconocida'}",
-                    f"El servidor DEVOLVIÓ (status {st}) un fichero de configuración/credenciales: "
-                    f"{event.resource or ''}. Posible fuga real de secretos.",
-                    "Descubrimiento / Acceso a archivos",
-                    [event],
-                    "URGENTE: confirmar qué se sirvió realmente; si contiene secretos, ROTARLOS ya y "
-                    "bloquear el acceso web al fichero (deny de dotfiles en nginx). NOTA: una SPA con "
-                    "fallback a index.html también responde 200 a /.env sin exponer nada — verificar "
-                    "el cuerpo antes de dar por cierta la fuga.",
-                ))
+                ip = event.ip or "IP desconocida"
+                sz = event.bytes_out
+                # ¿Cáscara de SPA? El fallback catch-all sirve el MISMO index.html (mismo tamaño) para
+                # cualquier ruta: si coincide con el tamaño de "/" de esa IP, o si esa IP ya recibió otro
+                # fichero sensible del mismo tamaño, NO es una fuga (es HTML, no el fichero real).
+                self._sens200_sizes[ip][sz] += 1
+                es_cascara_spa = sz is not None and (
+                    sz in self._root200_sizes.get(ip, set()) or self._sens200_sizes[ip][sz] >= 2)
+                if es_cascara_spa:
+                    findings.append(self._make_finding(
+                        19, "INFO",
+                        f"SPA sirve su index.html a sondeos de ficheros (HTTP 200, {sz} B) — sin exposición · {ip}",
+                        f"El servidor devolvió 200 a {event.resource or ''} pero con el MISMO tamaño ({sz} B) "
+                        f"que su página raíz u otros ficheros sondeados por la misma IP: es el index.html de una "
+                        f"SPA (fallback catch-all), no un fichero de configuración real. No hay fuga de secretos.",
+                        "Descubrimiento / Acceso a archivos",
+                        [event],
+                        "Falso positivo típico de SPA. Opcional: que la app/nginx devuelva 404 en rutas de "
+                        "configuración en vez del index.html. NO requiere rotar secretos.",
+                    ))
+                else:
+                    findings.append(self._make_finding(
+                        19, "CRITICAL",
+                        f"FICHERO SENSIBLE SERVIDO (HTTP {st}) a {ip}",
+                        f"El servidor DEVOLVIÓ (status {st}) un fichero de configuración/credenciales: "
+                        f"{event.resource or ''} ({sz} B). Posible fuga real de secretos.",
+                        "Descubrimiento / Acceso a archivos",
+                        [event],
+                        "URGENTE: confirmar qué se sirvió realmente; si contiene secretos, ROTARLOS ya y "
+                        "bloquear el acceso web al fichero (deny en nginx). NOTA: si el tamaño coincide con "
+                        "el del index.html podría ser una SPA — verificar el cuerpo antes de dar por cierta la fuga.",
+                    ))
             elif st in (301, 302, 400, 401, 403, 404, 405, 410, 444):
                 findings.append(self._make_finding(
                     19, "INFO",
