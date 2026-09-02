@@ -1061,6 +1061,15 @@ def _ip_is_private(ip_str: Optional[str]) -> bool:
         return False
 
 
+# FORA-023: rutas cuyo acceso periódico es legítimo POR DISEÑO y no debe marcarse
+# como baliza C2 (feeds de calendario, health-checks, polls de agentes, websockets).
+# El acceso periódico regular a estas rutas es normal, no beaconing.
+BEACON_EXCLUDE_PATHS = (
+    "/api/ical", "/ical", "/health", "/api/health", "/healthz", "/metrics",
+    "/api/agent/poll", "/ws", "/api/notifications/poll", "/api/updates",
+)
+
+
 def _severity_rank(s: str) -> int:
     return {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}.get(s, 0)
 
@@ -1188,10 +1197,14 @@ class Detector:
             self._login_attempts[event.user].append((event.ip, exito, event))
 
         # --- FORA-023: tracking beacon C2 ---
+        # Solo clientes EXTERNOS y rutas no-feed: un contenedor interno sondeando
+        # nuestros propios endpoints (sync de calendario, health, poll de agentes)
+        # es tráfico legítimo periódico, no una baliza C2 -> evita falsos positivos.
         if (event.log_type in ("web", "iis") and event.ip
                 and event.resource and event.timestamp and event.status == 200):
             ruta = (event.resource or "").split("?")[0][:80]
-            if len(ruta) > 3:
+            if (len(ruta) > 3 and not _ip_is_private(event.ip)
+                    and not ruta.startswith(BEACON_EXCLUDE_PATHS)):
                 key = (event.ip, ruta)
                 self._beacon_track[key].append(event.timestamp)
 
