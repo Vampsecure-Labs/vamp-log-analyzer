@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "vamp-log-analyzer"
+version = "2.0"
+description = "Log analysis and threat correlation engine for authorized security reviews"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "VampSecure Studios", email = "contact@vampsecurestudios.com" }]
+keywords = ["security", "pentest", "audit", "cybersecurity", "vampsecure", "log-analysis", "siem", "threat-hunting", "dfir"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = []
+
+
+[project.scripts]
+vamp-log-analyzer = "vamp_log_analyzer:main"
+
+[project.urls]
+Homepage = "https://github.com/Vampsecure-Labs/vamp-log-analyzer"
+Repository = "https://github.com/Vampsecure-Labs/vamp-log-analyzer"
+
+[tool.setuptools]
+py-modules = ["vamp_log_analyzer"]
