@@ -2674,7 +2674,7 @@ class EvidencePackager:
 
 
 class NarrativeGenerator:
-    """Genera narrativa forense en español usando LLM (Ollama o Claude API)."""
+    """Genera narrativa forense en español usando LLM (Ollama o API externa)."""
 
     @staticmethod
     def _prompt(report: "Report") -> str:
@@ -2730,8 +2730,9 @@ class NarrativeGenerator:
             return f"[Narrativa Ollama — error: {exc}]"
 
     @staticmethod
-    def claude(report: "Report", api_key: str,
-               model: str = "claude-haiku-4-5-20251001") -> str:
+    def api_llm(report: "Report", api_key: str,
+                endpoint: str = "https://api.anthropic.com/v1/messages",
+                model: str = "claude-haiku-4-5-20251001") -> str:
         payload = json.dumps({
             "model": model,
             "max_tokens": 600,
@@ -2739,7 +2740,7 @@ class NarrativeGenerator:
                            "content": NarrativeGenerator._prompt(report)}],
         }).encode("utf-8")
         req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages", data=payload,
+            endpoint, data=payload,
             headers={
                 "Content-Type": "application/json",
                 "x-api-key": api_key,
@@ -2750,7 +2751,7 @@ class NarrativeGenerator:
                 data = json.loads(resp.read())
                 return data["content"][0]["text"].strip()
         except Exception as exc:
-            return f"[Narrativa Claude — error: {exc}]"
+            return f"[Narrativa LLM — error: {exc}]"
 
 
 class StreamingAnalyzer:
@@ -3747,14 +3748,14 @@ def main() -> int:
                         help="Generar perfil estadístico de comportamiento normal y guardarlo")
     parser.add_argument("--baseline", metavar="BASELINE.json", dest="baseline_file",
                         help="Comparar análisis actual contra un baseline previo (generado con --learn)")
-    parser.add_argument("--narrative", choices=["ollama", "claude"], metavar="MOTOR",
-                        help="Generar narrativa forense en español con LLM (ollama|claude)")
+    parser.add_argument("--narrative", choices=["ollama", "api"], metavar="MOTOR",
+                        help="Generar narrativa forense en español con LLM (ollama|api)")
     parser.add_argument("--narrative-model", metavar="MODELO", default="llama3.2:3b",
                         help="Modelo LLM para la narrativa (default: llama3.2:3b con Ollama)")
     parser.add_argument("--narrative-host", metavar="URL", default="http://127.0.0.1:11434",
                         help="Host Ollama (default: http://127.0.0.1:11434)")
-    parser.add_argument("--claude-api-key", metavar="KEY", default="",
-                        help="API key de Anthropic para narrativa con Claude")
+    parser.add_argument("--llm-api-key", metavar="KEY", default="",
+                        help="API key para narrativa con LLM externo (var: LLM_API_KEY)")
     parser.add_argument("--follow", metavar="FICHERO",
                         help="Modo streaming: monitorizar fichero en tiempo real (tail -f)")
 
@@ -3894,12 +3895,12 @@ def main() -> int:
             report.narrative = NarrativeGenerator.ollama(
                 report, model=args.narrative_model, host=args.narrative_host)
         else:
-            api_key = args.claude_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+            api_key = args.llm_api_key or os.environ.get("LLM_API_KEY", "")
             if not api_key:
-                print("[!] --claude-api-key o variable ANTHROPIC_API_KEY requerida",
+                print("[!] --llm-api-key o variable LLM_API_KEY requerida",
                       file=sys.stderr)
             else:
-                report.narrative = NarrativeGenerator.claude(
+                report.narrative = NarrativeGenerator.api_llm(
                     report, api_key=api_key, model="claude-haiku-4-5-20251001")
         if report.narrative and not report.narrative.startswith("["):
             print(f"\n{'─' * 60}")
