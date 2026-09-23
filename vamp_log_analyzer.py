@@ -22,6 +22,8 @@ Fuentes de logs soportadas:
           journald (exportación JSON via journalctl -o json)
   WIN:    Windows Event Log exportado como XML (wevtutil qe Security /f:XML)
   MACOS:  macOS Unified Log JSON (log show --style json --last Xh)
+  SIEM:   Wazuh/OSSEC JSON (campos agent, rule, data, full_log)
+          OSSEC legacy (texto con patrón ** Alert …)
   GENÉR.: JSON estructurado (cualquier esquema con campo "timestamp")
           Texto libre (heurísticas de timestamp + patron)
 
@@ -63,6 +65,8 @@ USO
   python3 vamp_log_analyzer.py /logs/ --type auto --report-html forense.html
   python3 vamp_log_analyzer.py /logs/ --from 2026-01-01 --to 2026-01-31
   python3 vamp_log_analyzer.py auth.log nginx.log mysql.log --report-json ev.json
+  python3 vamp_log_analyzer.py alerts.json --type wazuh --report-html wazuh_report.html
+  python3 vamp_log_analyzer.py /var/ossec/logs/alerts.log --type ossec
 
 CÓDIGOS DE SALIDA
 -----------------
@@ -112,7 +116,7 @@ __   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___
  \ V / _ \| |\/| |  _/\__ \ _| (__| |_| |   / _|| |__ / _ \| _ \__ \
   \_/_/ \_\_|  |_|_|  |___/___\___|\___/|_|_\___|____/_/ \_\___/___/
   by Antonio Hernandez "Belky" — VampSecure Studios
-  vamp-log-analyzer v2.0 · Forensic Log Analysis Platform
+  vamp-log-analyzer v2.1 · Forensic Log Analysis Platform
   ────────────────────────────────────────────────────────────────────────
   USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
 """
@@ -372,6 +376,7 @@ class Report:
     ip_profiles: dict = dataclasses.field(default_factory=dict)  # {ip: perfil de actividad completa}
     baseline_delta: dict = dataclasses.field(default_factory=dict)  # comparativa vs baseline (v2.1)
     narrative: str = ""  # narrativa LLM del incidente (v2.1)
+    wazuh_rule_counts: dict = dataclasses.field(default_factory=dict)  # conteo de reglas Wazuh (v2.1)
 
     @property
     def summary(self) -> dict:
@@ -971,6 +976,240 @@ def parse_generic(path: str) -> Generator[LogEvent, None, None]:
             )
 
 
+# ============================================================
+# PARSERS WAZUH / OSSEC
+# ============================================================
+
+def _wazuh_level_to_severity(level: int) -> str:
+    """Mapea nivel de regla Wazuh (1-15) a severidad VSL."""
+    if level <= 5:
+        return "INFO"
+    if level <= 8:
+        return "LOW"
+    if level <= 11:
+        return "MEDIUM"
+    if level <= 14:
+        return "HIGH"
+    return "CRITICAL"
+
+
+def _is_wazuh_json(rec: dict) -> bool:
+    """
+    Determina si un dict JSON corresponde a formato Wazuh/OSSEC.
+    Heurística: presencia de campos característicos de Wazuh.
+    """
+    wazuh_keys = {"agent", "rule", "data", "full_log"}
+    if wazuh_keys & rec.keys():
+        return True
+    # Variante: program_name + rule.id coexisten
+    if "program_name" in rec and isinstance(rec.get("rule"), dict):
+        return True
+    return False
+
+
+def parse_wazuh_json(path: str) -> Generator[LogEvent, None, None]:
+    """
+    Parser para logs Wazuh en formato JSON (un objeto JSON por línea).
+
+    Campos parseados:
+      rule.id, rule.description, rule.level → severidad VSL
+      agent.name, agent.ip
+      data.srcip, data.dstip
+      timestamp
+    """
+    with _open_file(path) as fh:
+        for lineno, line in enumerate(fh, 1):
+            raw = line.rstrip("\n")
+            if not raw.strip():
+                continue
+            # Intentar parseo JSON
+            if not raw.strip().startswith("{"):
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            # Aceptar objetos Wazuh o arrays de objetos Wazuh
+            if isinstance(rec, list):
+                items = rec
+            else:
+                items = [rec]
+
+            for obj in items:
+                if not isinstance(obj, dict):
+                    continue
+                # Detectar formato Wazuh
+                if not _is_wazuh_json(obj):
+                    yield LogEvent(
+                        timestamp=None, source_file=path, source_line=lineno,
+                        log_type="generic", raw=json.dumps(obj),
+                    )
+                    continue
+
+                # Parsear timestamp
+                ts = None
+                ts_raw = obj.get("timestamp", "")
+                if ts_raw:
+                    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                                "%Y-%m-%d %H:%M:%S"):
+                        try:
+                            ts = datetime.datetime.strptime(ts_raw[:26], fmt)
+                            break
+                        except ValueError:
+                            pass
+                    if ts is None:
+                        # Intentar parseo genérico con ISO fromisoformat
+                        try:
+                            ts = datetime.datetime.fromisoformat(ts_raw[:19])
+                        except ValueError:
+                            pass
+
+                # Campos de regla
+                rule = obj.get("rule", {}) if isinstance(obj.get("rule"), dict) else {}
+                rule_id = str(rule.get("id", "")) or None
+                rule_desc = rule.get("description", "")
+                rule_level = int(rule.get("level", 0)) if rule.get("level") is not None else 0
+
+                # Campos de agente
+                agent = obj.get("agent", {}) if isinstance(obj.get("agent"), dict) else {}
+                agent_name = agent.get("name", "") or None
+                agent_ip = agent.get("ip", "") or None
+
+                # Campos de datos: IP de origen
+                data = obj.get("data", {}) if isinstance(obj.get("data"), dict) else {}
+                src_ip = (data.get("srcip") or data.get("src_ip") or
+                          agent_ip or obj.get("srcip")) or None
+                dst_ip = (data.get("dstip") or data.get("dst_ip")) or None
+
+                # Mensaje completo
+                full_log = obj.get("full_log", "") or obj.get("message", "") or rule_desc
+
+                yield LogEvent(
+                    timestamp=ts,
+                    source_file=path,
+                    source_line=lineno,
+                    log_type="wazuh",
+                    raw=raw[:500],
+                    ip=src_ip,
+                    user=agent_name,
+                    action=_wazuh_level_to_severity(rule_level),
+                    resource=full_log[:300],
+                    extra={
+                        "rule_id": rule_id,
+                        "rule_description": rule_desc,
+                        "rule_level": rule_level,
+                        "agent_name": agent_name,
+                        "agent_ip": agent_ip,
+                        "dst_ip": dst_ip,
+                        "wazuh_severity": _wazuh_level_to_severity(rule_level),
+                    },
+                )
+
+
+# Patrón cabecera OSSEC: ** Alert <epoch>.<seq>: - <groups>
+RE_OSSEC_ALERT_HDR = re.compile(
+    r'^\*\* Alert (\d+(?:\.\d+)?): - (.+)$'
+)
+# Patrón línea de fecha/host OSSEC: <fecha> <host>->/<componente>
+RE_OSSEC_HOST_LINE = re.compile(
+    r'^(\d{4} \w+ \d{2} \d{2}:\d{2}:\d{2})\s+(\S+)->(\S+)$'
+)
+
+
+def parse_ossec_text(path: str) -> Generator[LogEvent, None, None]:
+    """
+    Parser para logs OSSEC legacy en formato texto.
+
+    Patrón de bloque OSSEC:
+      ** Alert <timestamp>: - <groups>
+      <date> <host>->/<component>: <message>
+      <lines de mensaje>
+
+    Se parsean: timestamp, host, componente y mensaje.
+    """
+    _OSSEC_TS_FMT = "%Y %b %d %H:%M:%S"
+
+    with _open_file(path) as fh:
+        lines = fh.readlines()
+
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i].rstrip("\n")
+        m_hdr = RE_OSSEC_ALERT_HDR.match(raw_line)
+        if not m_hdr:
+            i += 1
+            continue
+
+        # Línea de cabecera
+        epoch_str = m_hdr.group(1)
+        groups = m_hdr.group(2)
+        block_start = i + 1
+        ts = None
+        try:
+            ts = datetime.datetime.fromtimestamp(float(epoch_str))
+        except (ValueError, OSError):
+            pass
+
+        host = None
+        component = None
+        msg_lines = []
+
+        # Siguiente línea: fecha + host->componente
+        i += 1
+        if i < len(lines):
+            raw_host = lines[i].rstrip("\n")
+            m_host = RE_OSSEC_HOST_LINE.match(raw_host)
+            if m_host:
+                ts_str = m_host.group(1)
+                host = m_host.group(2)
+                component = m_host.group(3)
+                if ts is None:
+                    try:
+                        ts = datetime.datetime.strptime(ts_str, _OSSEC_TS_FMT)
+                    except ValueError:
+                        pass
+                i += 1
+
+        # Líneas de mensaje hasta el siguiente bloque o línea vacía
+        while i < len(lines):
+            raw_msg = lines[i].rstrip("\n")
+            if RE_OSSEC_ALERT_HDR.match(raw_msg) or raw_msg == "":
+                break
+            msg_lines.append(raw_msg)
+            i += 1
+
+        message = " ".join(msg_lines[:5])
+
+        # Extraer IP del mensaje si está disponible
+        ip = None
+        m_ip = RE_GENERIC_IP.search(message)
+        if m_ip:
+            try:
+                addr = ipaddress.ip_address(m_ip.group(1))
+                if not addr.is_loopback and not addr.is_link_local:
+                    ip = m_ip.group(1)
+            except ValueError:
+                pass
+
+        yield LogEvent(
+            timestamp=ts,
+            source_file=path,
+            source_line=block_start,
+            log_type="ossec",
+            raw=raw_line[:400],
+            ip=ip,
+            user=host,
+            action="OSSEC_ALERT",
+            resource=message[:300],
+            extra={
+                "groups": groups,
+                "host": host,
+                "component": component,
+            },
+        )
+
+
 # --- Detección automática del tipo de log ---
 def detect_log_type(path: str) -> str:
     """Inspecciona las primeras líneas para determinar el tipo de log."""
@@ -985,6 +1224,16 @@ def detect_log_type(path: str) -> str:
         return "generic"
 
     content = "".join(sample)
+
+    # Wazuh JSON: campos característicos en objetos JSON
+    if re.search(r'"rule"\s*:\s*\{', content) and (
+        '"agent"' in content or '"full_log"' in content or '"program_name"' in content
+    ):
+        return "wazuh"
+
+    # OSSEC legacy (texto plano)
+    if "** Alert " in content and "->" in content:
+        return "ossec"
 
     # Windows XML
     if "<Events" in content or "<Event xmlns" in content:
@@ -1044,6 +1293,8 @@ def get_parser(log_type: str):
         "linux_sys": parse_syslog,
         "windows": parse_windows_xml,
         "macos": parse_macos_unified,
+        "wazuh": parse_wazuh_json,
+        "ossec": parse_ossec_text,
         "generic": parse_generic,
     }.get(log_type, parse_generic)
 
@@ -1810,6 +2061,8 @@ def analyze_files(
     total_events = 0
     ts_min: Optional[datetime.datetime] = None
     ts_max: Optional[datetime.datetime] = None
+    # Contador de reglas Wazuh: {rule_id: count}
+    wazuh_rule_counts: collections.Counter = collections.Counter()
 
     for path in paths:
         ltype = log_type if log_type != "auto" else detect_log_type(path)
@@ -1832,6 +2085,12 @@ def analyze_files(
                         ts_max = event.timestamp
 
                 total_events += 1
+
+                # Acumular conteo de reglas Wazuh si aplica
+                if event.log_type == "wazuh":
+                    rule_id = event.extra.get("rule_id") if event.extra else None
+                    if rule_id:
+                        wazuh_rule_counts[rule_id] += 1
 
                 # Análisis estático
                 per_event = detector.analyze_event(event)
@@ -1932,6 +2191,7 @@ def analyze_files(
         timeline_analysis=ta,
         geoip_data=geoip,
         ip_profiles=ip_profiles,
+        wazuh_rule_counts=dict(wazuh_rule_counts),
     )
 
 
@@ -3675,6 +3935,14 @@ def print_summary(report: Report) -> None:
             pico = max(p["distribucion_hora_utc"].items(), key=lambda x: x[1])
             print(f"    {ip:<18} {ev:>5} eventos · {dias} día(s){auth_str}  [pico: {pico[0]}h UTC]")
 
+    # Distribución de reglas Wazuh (solo si hay datos)
+    if report.wazuh_rule_counts:
+        print(f"{'─' * 60}")
+        top_rules = sorted(report.wazuh_rule_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        print(f"  Top {len(top_rules)} reglas Wazuh más frecuentes (de {len(report.wazuh_rule_counts)} únicas):")
+        for rule_id, count in top_rules:
+            print(f"    [{count:>5}x]  Regla {rule_id}")
+
     print(f"{'═' * 60}\n")
 
 
@@ -3696,8 +3964,11 @@ def main() -> int:
     parser.add_argument("paths", nargs="*", help="Ficheros o directorios de log a analizar")
     parser.add_argument("--type", default="auto",
                         choices=["auto","web","iis","db_mysql","db_postgres","db_mongo",
-                                 "linux_auth","linux_sys","windows","macos","generic"],
-                        help="Tipo de log (default: auto-detectar)")
+                                 "linux_auth","linux_sys","windows","macos",
+                                 "wazuh","ossec","generic"],
+                        help="Tipo de log (default: auto-detectar). "
+                             "wazuh: JSON de Wazuh/OSSEC con campos agent/rule/data. "
+                             "ossec: texto OSSEC legacy (** Alert …).")
     parser.add_argument("--from", dest="time_from", metavar="YYYY-MM-DD",
                         help="Analizar solo eventos desde esta fecha UTC")
     parser.add_argument("--to", dest="time_to", metavar="YYYY-MM-DD",
