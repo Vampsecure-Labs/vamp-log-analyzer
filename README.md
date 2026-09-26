@@ -1,3 +1,4 @@
+<!-- © VampSecure Studios — VampSecure Labs Security Research Division -->
 <h1 align="center">vamp-log-analyzer</h1>
 
 <p align="center">
@@ -59,6 +60,13 @@ La detección del tipo de log es automática (`--type auto`, predeterminada).
 - Sin dependencias externas (stdlib only)
 
 ## Instalación
+
+
+```bash
+pip install vamp-log-analyzer
+# o con Homebrew:
+brew install vampsecure-labs/labs/vamp-log-analyzer
+```
 
 ```bash
 git clone https://github.com/Vampsecure-Labs/vamp-log-analyzer.git
@@ -449,3 +457,6 @@ VampSecure Studios no asume responsabilidad por el uso no autorizado de esta her
 ---
 
 © VampSecure Studios — VampSecure Labs Security Research Division
+
+## Versión
+v2.1 — VampSecure Labs Security Research Division
