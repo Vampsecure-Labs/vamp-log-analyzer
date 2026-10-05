@@ -102,11 +102,17 @@ import xml.etree.ElementTree as ET
 import zipfile
 from typing import Dict, Generator, Iterable, List, Optional, Tuple
 
+try:
+    import yaml as _yaml
+    _YAML_OK = True
+except ImportError:
+    _YAML_OK = False
+
 # ============================================================
 # VERSIÓN Y METADATOS
 # ============================================================
 
-VERSION = "2.1"
+VERSION = "2.2"
 TOOL = "vamp-log-analyzer"
 FINDING_PREFIX = "FORA"
 
@@ -116,7 +122,7 @@ __   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___
  \ V / _ \| |\/| |  _/\__ \ _| (__| |_| |   / _|| |__ / _ \| _ \__ \
   \_/_/ \_\_|  |_|_|  |___/___\___|\___/|_|_\___|____/_/ \_\___/___/
   by Antonio Hernandez "Belky" — VampSecure Studios
-  vamp-log-analyzer v2.1 · Forensic Log Analysis Platform
+  vamp-log-analyzer v2.2 · Forensic Log Analysis Platform
   ────────────────────────────────────────────────────────────────────────
   USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
 """
@@ -2037,6 +2043,401 @@ class Detector:
 
 
 # ============================================================
+# MOTOR SIGMA — soporte de reglas de detección comunitarias
+# ============================================================
+#
+# Implementa un subconjunto del estándar Sigma v1/v2:
+#   - Selecciones con modificadores: equals, contains, startswith,
+#     endswith, re, cidr, base64, all
+#   - Condiciones: and / or / not, 1 of X*, all of them
+#   - Mapeo de campos abstractos a LogEvent
+#   - Carga de reglas desde fichero .yml/.yaml o directorio
+# ------------------------------------------------------------
+
+@dataclasses.dataclass
+class SigmaRule:
+    """Regla Sigma parseada."""
+    title: str
+    rule_id: str
+    status: str
+    description: str
+    level: str          # informational, low, medium, high, critical
+    tags: List[str]
+    logsource: Dict[str, str]
+    detection: Dict
+    falsepositives: List[str]
+    path: str
+
+
+# Mapeo campos Sigma abstractos → atributos de LogEvent / extra
+_SIGMA_FIELD_MAP: Dict[str, str] = {
+    # red / web
+    "src_ip": "ip", "c-ip": "ip", "src-ip": "ip",
+    "destinationip": "ip", "dst_ip": "ip",
+    "cs-uri-stem": "resource", "cs-uri-query": "resource",
+    "requesturi": "resource", "uri": "resource", "path": "resource",
+    "method": "action", "http_method": "action", "cs-method": "action",
+    "useragent": "user_agent", "user_agent": "user_agent",
+    "cs(user-agent)": "user_agent", "http_user_agent": "user_agent",
+    "sc-status": "status", "status": "status",
+    # autenticación
+    "user": "user", "username": "user", "targetusername": "user",
+    "subjectusername": "user", "accountname": "user",
+    # proceso (Windows)
+    "commandline": "action", "parentcommandline": "action",
+    "image": "resource", "parentimage": "resource",
+    "processname": "resource", "originalfilename": "resource",
+    # syslog / genérico
+    "message": "raw", "msg": "raw", "log.message": "raw",
+    "eventid": "extra.event_id", "event_id": "extra.event_id",
+    "servicename": "extra.service", "service": "extra.service",
+    # Wazuh
+    "rule.description": "raw", "full_log": "raw",
+}
+
+
+def _sigma_level_to_severity(level: str) -> str:
+    """Convierte nivel Sigma a severidad VSL."""
+    return {
+        "informational": "INFO",
+        "low": "LOW",
+        "medium": "MEDIUM",
+        "high": "HIGH",
+        "critical": "CRITICAL",
+    }.get(level.lower(), "MEDIUM")
+
+
+def _logsource_matches(rule_ls: Dict[str, str], log_type: str) -> bool:
+    """
+    Comprueba si la logsource de la regla es compatible con el tipo de log.
+    Se usa matching flexible: una regla web se aplica a logs web, una regla
+    windows a logs windows, etc. Si la logsource está vacía, se aplica a todo.
+    """
+    if not rule_ls:
+        return True
+
+    product = rule_ls.get("product", "").lower()
+    category = rule_ls.get("category", "").lower()
+    service = rule_ls.get("service", "").lower()
+
+    web_types = {"web", "apache", "nginx", "iis", "generic"}
+    linux_types = {"linux_auth", "linux_sys", "syslog", "generic"}
+    win_types = {"windows", "generic"}
+    mac_types = {"macos", "generic"}
+    db_types = {"db_mysql", "db_postgres", "db_mongo", "generic"}
+
+    if product in ("windows", "microsoft"):
+        return log_type in win_types
+    if product == "linux":
+        return log_type in linux_types
+    if product == "macos":
+        return log_type in mac_types
+    if product in ("apache", "nginx", "iis", "webserver"):
+        return log_type in web_types
+    if category in ("webserver", "web"):
+        return log_type in web_types
+    if category in ("process_creation", "file_access", "authentication"):
+        return log_type in (linux_types | win_types)
+    if service in ("auth", "sshd", "sudo"):
+        return log_type in linux_types
+    # Sin restricción clara → aplicar a todos
+    return True
+
+
+def _get_event_field(field_name: str, event: LogEvent) -> Optional[str]:
+    """
+    Extrae el valor de un campo de LogEvent dado el nombre abstracto Sigma.
+    Devuelve siempre str para comparaciones, None si no está disponible.
+    """
+    mapped = _SIGMA_FIELD_MAP.get(field_name.lower(), field_name.lower())
+
+    if mapped == "ip":
+        val = event.ip
+    elif mapped == "user":
+        val = event.user
+    elif mapped == "action":
+        val = event.action
+    elif mapped == "resource":
+        val = event.resource
+    elif mapped == "status":
+        val = str(event.status) if event.status is not None else None
+    elif mapped == "user_agent":
+        val = event.user_agent
+    elif mapped == "raw":
+        val = event.raw
+    elif mapped.startswith("extra."):
+        key = mapped[6:]
+        val = (event.extra or {}).get(key)
+    else:
+        # Búsqueda en extra con el nombre original
+        val = (event.extra or {}).get(field_name)
+        if val is None:
+            # Último recurso: buscar en raw
+            val = event.raw
+
+    return str(val) if val is not None else None
+
+
+def _match_value(modifier: str, field_val: str, pattern) -> bool:
+    """Aplica un modificador Sigma a un valor de campo."""
+    if isinstance(pattern, list):
+        return any(_match_value(modifier, field_val, p) for p in pattern)
+    pattern_str = str(pattern)
+    mod_lower = modifier.lower() if modifier else "exact"
+
+    if mod_lower in ("exact", "equals", ""):
+        return field_val.lower() == pattern_str.lower()
+    if mod_lower == "contains":
+        return pattern_str.lower() in field_val.lower()
+    if mod_lower == "startswith":
+        return field_val.lower().startswith(pattern_str.lower())
+    if mod_lower == "endswith":
+        return field_val.lower().endswith(pattern_str.lower())
+    if mod_lower == "re":
+        try:
+            return bool(re.search(pattern_str, field_val, re.IGNORECASE))
+        except re.error:
+            return False
+    if mod_lower == "cidr":
+        try:
+            ip_obj = ipaddress.ip_address(field_val)
+            net_obj = ipaddress.ip_network(pattern_str, strict=False)
+            return ip_obj in net_obj
+        except ValueError:
+            return False
+    if mod_lower == "base64":
+        import base64 as _b64
+        try:
+            decoded = _b64.b64decode(pattern_str).decode("utf-8", errors="ignore")
+            return decoded.lower() in field_val.lower()
+        except Exception:
+            return False
+    # Modificador desconocido → búsqueda por contiene
+    return pattern_str.lower() in field_val.lower()
+
+
+def _parse_field_expr(key: str) -> Tuple[str, str]:
+    """
+    Descompone 'CommandLine|contains' en ('CommandLine', 'contains').
+    Si no hay modificador devuelve ('CommandLine', 'exact').
+    """
+    if "|" in key:
+        parts = key.split("|", 1)
+        return parts[0], parts[1]
+    return key, "exact"
+
+
+def _eval_sigma_selection(selection_def, event: LogEvent) -> bool:
+    """
+    Evalúa una selección Sigma (dict de campo → valor / lista de valores).
+    Todas las claves del dict deben coincidir (AND implícito entre campos).
+    """
+    if not isinstance(selection_def, dict):
+        return False
+
+    for key, val in selection_def.items():
+        # El modificador "all" obliga a que todos los valores de la lista coincidan
+        all_modifier = False
+        if "|" in key and key.split("|", 1)[1].lower() == "all":
+            field_name = key.split("|", 1)[0]
+            modifier = "contains"  # all suele combinarse con contains
+            all_modifier = True
+        else:
+            field_name, modifier = _parse_field_expr(key)
+
+        field_val = _get_event_field(field_name, event)
+        if field_val is None:
+            return False
+
+        if all_modifier:
+            # Todos los valores de la lista deben estar presentes
+            items = val if isinstance(val, list) else [val]
+            if not all(_match_value(modifier, field_val, p) for p in items):
+                return False
+        else:
+            if not _match_value(modifier, field_val, val):
+                return False
+
+    return True
+
+
+def _eval_sigma_condition(condition_str: str, named_results: Dict[str, bool]) -> bool:
+    """
+    Evalúa la condición Sigma usando los resultados pre-calculados de cada selección.
+    Soporta: and, or, not, 1 of X*, all of them, X of Y*
+    """
+    cond = condition_str.strip()
+
+    # '1 of X*' — al menos 1 selección que case con el patrón wildcard
+    m = re.match(r"(\d+)\s+of\s+(\S+)", cond, re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        pattern = re.compile(m.group(2).replace("*", ".*"), re.IGNORECASE)
+        matches = [v for k, v in named_results.items() if pattern.match(k)]
+        return sum(1 for v in matches if v) >= n
+
+    # 'all of them' — todas las selecciones nominadas deben ser True
+    if re.match(r"all\s+of\s+them", cond, re.IGNORECASE):
+        return all(named_results.values())
+
+    # 'all of X*' — todas las selecciones que casen con el patrón
+    m2 = re.match(r"all\s+of\s+(\S+)", cond, re.IGNORECASE)
+    if m2:
+        pattern = re.compile(m2.group(1).replace("*", ".*"), re.IGNORECASE)
+        matches = [v for k, v in named_results.items() if pattern.match(k)]
+        return all(matches) if matches else False
+
+    # Tokenizar para manejar and/or/not con paréntesis simples
+    def _resolve_token(token: str) -> bool:
+        token = token.strip().strip("()")
+        return named_results.get(token, False)
+
+    # Eliminar paréntesis externos y evaluar izquierda a derecha
+    # Simplificación: soporte básico de una capa de and/or/not
+    cond_clean = re.sub(r"[()]", "", cond).strip()
+
+    # NOT simple
+    if cond_clean.lower().startswith("not "):
+        inner = cond_clean[4:].strip()
+        return not _resolve_token(inner)
+
+    # OR (evaluar antes de AND para respetar precedencia estándar Sigma)
+    if " or " in cond_clean.lower():
+        parts = re.split(r"\bor\b", cond_clean, flags=re.IGNORECASE)
+        return any(_eval_sigma_condition(p.strip(), named_results) for p in parts)
+
+    # AND
+    if " and " in cond_clean.lower():
+        parts = re.split(r"\band\b", cond_clean, flags=re.IGNORECASE)
+        return all(_eval_sigma_condition(p.strip(), named_results) for p in parts)
+
+    # Token simple
+    return _resolve_token(cond_clean)
+
+
+def _rule_matches_event(rule: SigmaRule, event: LogEvent) -> bool:
+    """Devuelve True si la regla Sigma coincide con el evento."""
+    if not _logsource_matches(rule.logsource, event.log_type):
+        return False
+
+    detection = rule.detection
+    if not detection:
+        return False
+
+    # Construir resultados de cada selección nominada
+    named_results: Dict[str, bool] = {}
+    condition_str = detection.get("condition", "")
+
+    for key, val in detection.items():
+        if key == "condition" or not isinstance(val, dict):
+            continue
+        named_results[key] = _eval_sigma_selection(val, event)
+
+    # Si no hay selecciones nominadas pero hay un dict anónimo
+    if not named_results and isinstance(condition_str, str):
+        # Intentar evaluar como selección única
+        for key, val in detection.items():
+            if key != "condition" and isinstance(val, dict):
+                named_results[key] = _eval_sigma_selection(val, event)
+
+    if not condition_str:
+        # Sin condition → AND de todas las selecciones
+        return all(named_results.values()) if named_results else False
+
+    return _eval_sigma_condition(str(condition_str), named_results)
+
+
+class SigmaLoader:
+    """Carga y valida reglas Sigma desde ficheros YAML o directorios."""
+
+    @staticmethod
+    def from_file(path: str) -> Optional[SigmaRule]:
+        """Carga una regla Sigma desde un fichero .yml/.yaml."""
+        if not _YAML_OK:
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh)
+            if not isinstance(data, dict) or "detection" not in data:
+                return None
+            return SigmaRule(
+                title=data.get("title", pathlib.Path(path).stem),
+                rule_id=data.get("id", str(uuid.uuid4())),
+                status=data.get("status", "unknown"),
+                description=data.get("description", ""),
+                level=data.get("level", "medium"),
+                tags=data.get("tags", []) or [],
+                logsource=data.get("logsource", {}) or {},
+                detection=data.get("detection", {}),
+                falsepositives=data.get("falsepositives", []) or [],
+                path=path,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def from_dir(dir_path: str) -> List[SigmaRule]:
+        """Carga todas las reglas Sigma de un directorio (recursivo)."""
+        rules: List[SigmaRule] = []
+        for root, _, files in os.walk(dir_path):
+            for fname in files:
+                if fname.endswith((".yml", ".yaml")):
+                    rule = SigmaLoader.from_file(os.path.join(root, fname))
+                    if rule:
+                        rules.append(rule)
+        return rules
+
+    @staticmethod
+    def load(path: str) -> List[SigmaRule]:
+        """Acepta tanto un fichero como un directorio."""
+        if not _YAML_OK:
+            print("[!] PyYAML no instalado — soporte Sigma desactivado. "
+                  "Instala con: pip install pyyaml", file=sys.stderr)
+            return []
+        p = pathlib.Path(path)
+        if p.is_dir():
+            return SigmaLoader.from_dir(path)
+        rule = SigmaLoader.from_file(path)
+        return [rule] if rule else []
+
+
+def apply_sigma_rules(
+    rules: List[SigmaRule],
+    event: LogEvent,
+) -> List[Finding]:
+    """
+    Aplica las reglas Sigma a un evento y devuelve los Finding generados.
+    Cada regla que coincide produce un Finding con prefijo SIGMA-.
+    """
+    findings: List[Finding] = []
+    for rule in rules:
+        if _rule_matches_event(rule, event):
+            # Extraer tácticas/técnicas ATT&CK de las tags
+            attack_tags = [t for t in rule.tags if t.lower().startswith("attack.t")]
+            attack_phase = attack_tags[0] if attack_tags else "Sigma Rule"
+
+            findings.append(Finding(
+                fid=f"SIGMA-{rule.rule_id[:8].upper()}",
+                severity=_sigma_level_to_severity(rule.level),
+                title=f"[Sigma] {rule.title}",
+                description=rule.description or rule.title,
+                attack_phase=attack_phase,
+                evidence=[event.raw],
+                events=[event],
+                first_seen=event.timestamp,
+                last_seen=event.timestamp,
+                ips=[event.ip] if event.ip else [],
+                users=[event.user] if event.user else [],
+                remediation=(
+                    f"Revisar falsos positivos: {'; '.join(rule.falsepositives)}"
+                    if rule.falsepositives else
+                    f"Ver regla Sigma: {rule.path}"
+                ),
+            ))
+    return findings
+
+
+# ============================================================
 # MOTOR DE ANÁLISIS PRINCIPAL
 # ============================================================
 
@@ -2054,6 +2455,7 @@ def analyze_files(
     enable_geoip: bool = False,
     scope: Optional[ScopeConfig] = None,
     session_gap_min: int = 30,
+    sigma_rules: Optional[List[SigmaRule]] = None,
 ) -> Report:
     detector = Detector(config)
     all_findings: List[Finding] = []
@@ -2092,9 +2494,13 @@ def analyze_files(
                     if rule_id:
                         wazuh_rule_counts[rule_id] += 1
 
-                # Análisis estático
+                # Análisis estático (detectores FORA)
                 per_event = detector.analyze_event(event)
                 all_findings.extend(per_event)
+
+                # Reglas Sigma comunitarias
+                if sigma_rules:
+                    all_findings.extend(apply_sigma_rules(sigma_rules, event))
 
                 # Estado acumulativo (brute force, spray, etc.)
                 detector.process(event)
@@ -4026,6 +4432,8 @@ def main() -> int:
                         help="Host Ollama (default: http://127.0.0.1:11434)")
     parser.add_argument("--claude-api-key", metavar="KEY", default="",
                         help="API key de Anthropic para narrativa con Claude")
+    parser.add_argument("--sigma-rules", metavar="RUTA", dest="sigma_rules",
+                        help="Fichero .yml o directorio con reglas Sigma para detección adicional")
     parser.add_argument("--follow", metavar="FICHERO",
                         help="Modo streaming: monitorizar fichero en tiempo real (tail -f)")
 
@@ -4095,6 +4503,16 @@ def main() -> int:
             print(f"[!] Error cargando scope: {e}", file=sys.stderr)
             return 2
 
+    # Cargar reglas Sigma si se especificaron
+    sigma_rules: List[SigmaRule] = []
+    if getattr(args, "sigma_rules", None):
+        sigma_rules = SigmaLoader.load(args.sigma_rules)
+        if sigma_rules:
+            print(f"[*] {len(sigma_rules)} reglas Sigma cargadas desde: {args.sigma_rules}",
+                  file=sys.stderr)
+        else:
+            print(f"[!] No se cargaron reglas Sigma desde: {args.sigma_rules}", file=sys.stderr)
+
     # Análisis
     config = build_config(args, scope)
     report = analyze_files(
@@ -4105,6 +4523,7 @@ def main() -> int:
         enable_geoip=args.geoip,
         session_gap_min=args.session_gap,
         scope=scope,
+        sigma_rules=sigma_rules or None,
     )
 
     # Filtrar por severidad mínima
