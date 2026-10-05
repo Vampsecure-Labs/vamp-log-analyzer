@@ -13,7 +13,6 @@ import datetime
 import statistics
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -21,12 +20,7 @@ from vamp_log_analyzer import (
     Detector,
     LogEvent,
     RE_SQLI,
-    RE_XSS,
     RE_TRAVERSAL,
-    RE_WEBSHELL,
-    RE_SENSITIVE_FILES,
-    RE_SCANNER_UA,
-    FINDING_PREFIX,
     detect_log_type,
     parse_apache,
     _parse_auth_ts,
@@ -399,7 +393,7 @@ class TestReconstruccionSesion:
     def test_eventos_misma_ip_agrupados(self, detector_defecto):
         """Varios eventos de la misma IP se almacenan juntos."""
         ip = "10.1.2.3"
-        base = datetime.datetime(2026, 10, 1, 10, 0, 0)
+        datetime.datetime(2026, 10, 1, 10, 0, 0)
         for i in range(5):
             e = _evento_web(ip, f"/page{i}", 200, offset_sec=i * 60)
             detector_defecto.process(e)
@@ -470,7 +464,7 @@ class TestSeveridadHallazgos:
 # 14. Motor Sigma — SigmaLoader + SigmaEngine
 # ─────────────────────────────────────────────────────────────────────────────
 
-import tempfile, os, datetime as _dt, dataclasses
+import datetime as _dt
 
 from vamp_log_analyzer import (
     SigmaRule, SigmaLoader, apply_sigma_rules,

@@ -103,13 +103,20 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
-from typing import Dict, Generator, Iterable, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 try:
     import yaml as _yaml
     _YAML_OK = True
 except ImportError:
     _YAML_OK = False
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    _RICH_OK = True
+except ImportError:
+    _RICH_OK = False
 
 # ============================================================
 # VERSIÓN Y METADATOS
@@ -1748,7 +1755,7 @@ class Detector:
             findings.append(self._make_finding(
                 14, "HIGH",
                 f"Nueva cuenta de usuario creada: {event.user or '?'}",
-                f"Se creó una cuenta de usuario en el sistema. Verificar si es legítima.",
+                "Se creó una cuenta de usuario en el sistema. Verificar si es legítima.",
                 "Persistencia — Cuenta nueva",
                 [event],
                 "Verificar si la creación fue autorizada. Comprobar grupos del usuario. "
@@ -1926,7 +1933,7 @@ class Detector:
                 f"Acciones totales: {acc_global_str}."
             )
 
-            usuarios_noche = sorted({e.user for e in eventos_noche if e.user})
+            sorted({e.user for e in eventos_noche if e.user})
 
             self._findings_raw.append(self._make_finding(
                 15, "LOW",
@@ -2127,7 +2134,6 @@ def _logsource_matches(rule_ls: Dict[str, str], log_type: str) -> bool:
     linux_types = {"linux_auth", "linux_sys", "syslog", "generic"}
     win_types = {"windows", "generic"}
     mac_types = {"macos", "generic"}
-    db_types = {"db_mysql", "db_postgres", "db_mongo", "generic"}
 
     if product in ("windows", "microsoft"):
         return log_type in win_types
@@ -3586,7 +3592,7 @@ def to_forensic_txt(report: Report) -> str:
 
     # --- Cabecera ---
     lineas.append(sep)
-    lineas.append(f"  INFORME FORENSE DE ANÁLISIS DE LOGS")
+    lineas.append("  INFORME FORENSE DE ANÁLISIS DE LOGS")
     lineas.append(f"  {TOOL} v{VERSION}  ·  © VampSecure Studios — VampSecure Labs")
     lineas.append(sep)
 
@@ -3688,17 +3694,17 @@ def to_forensic_txt(report: Report) -> str:
                 lineas.append(f"      Hallazgos: {', '.join(entry['hallazgos'][:5])}")
         rutas_ioc = iocs.get("rutas_objetivo", [])
         if rutas_ioc:
-            lineas.append(f"\n  Rutas objetivo más atacadas:")
+            lineas.append("\n  Rutas objetivo más atacadas:")
             for entry in rutas_ioc[:20]:
                 lineas.append(f"    · ({entry['ocurrencias']:>4}x)  {entry['ruta']}")
         ua_ioc = iocs.get("user_agents_sospechosos", [])
         if ua_ioc:
-            lineas.append(f"\n  User-Agents de herramientas de ataque:")
+            lineas.append("\n  User-Agents de herramientas de ataque:")
             for entry in ua_ioc[:10]:
                 lineas.append(f"    · ({entry['ocurrencias']:>3}x)  {entry['ua'][:100]}")
         usr_ioc = iocs.get("usuarios_objetivo", [])
         if usr_ioc:
-            lineas.append(f"\n  Usuarios objetivo (cuentas atacadas):")
+            lineas.append("\n  Usuarios objetivo (cuentas atacadas):")
             for entry in usr_ioc[:20]:
                 lineas.append(f"    · ({entry['ocurrencias']:>4}x)  {entry['usuario']}")
 
@@ -3721,7 +3727,7 @@ def to_forensic_txt(report: Report) -> str:
             if p["fuentes_log"]:
                 lineas.append(f"  Ficheros de log  : {', '.join(p['fuentes_log'][:5])}")
             # Franjas horarias
-            lineas.append(f"  Franjas horarias (UTC):")
+            lineas.append("  Franjas horarias (UTC):")
             lineas.append(f"    Madrugada 00-06h : {p['franja_madrugada_0_6h']:>5} eventos")
             lineas.append(f"    Mañana    06-12h : {p['franja_manana_6_12h']:>5} eventos")
             lineas.append(f"    Tarde     12-18h : {p['franja_tarde_12_18h']:>5} eventos")
@@ -3794,8 +3800,8 @@ def to_forensic_txt(report: Report) -> str:
     lineas.append("")
     lineas.append(sep)
     lineas.append(f"  FIN DEL INFORME  ·  {TOOL} v{VERSION}")
-    lineas.append(f"  © VampSecure Studios — VampSecure Labs Security Research Division")
-    lineas.append(f"  Uso exclusivo en entornos autorizados.")
+    lineas.append("  © VampSecure Studios — VampSecure Labs Security Research Division")
+    lineas.append("  Uso exclusivo en entornos autorizados.")
     lineas.append(sep)
 
     return "\n".join(lineas)
@@ -4314,7 +4320,7 @@ def print_summary(report: Report) -> None:
     s = report.summary
     print(f"\n{'═' * 60}")
     print(f"  {TOOL} v{VERSION}")
-    print(f"  © VampSecure Studios — VampSecure Labs")
+    print("  © VampSecure Studios — VampSecure Labs")
     print(f"{'═' * 60}")
     print(f"  Eventos procesados : {report.total_events_parsed:>8,}")
     print(f"  Período analizado  : {report.time_range_start or '?'[:19]} → {report.time_range_end or '?'[:19]}")
