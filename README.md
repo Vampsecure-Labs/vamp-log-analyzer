@@ -4,9 +4,9 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white" alt="Python 3.9+"/>
   <img src="https://img.shields.io/badge/stdlib%20only-no%20deps-brightgreen" alt="stdlib only"/>
-  <img src="https://img.shields.io/badge/version-2.1-orange" alt="v2.1"/>
+  <img src="https://img.shields.io/badge/version-2.2-orange" alt="v2.2"/>
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey" alt="Platform"/>
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="License MIT"/>
+  <img src="https://img.shields.io/badge/license-AGPL--3.0-green" alt="License AGPL-3.0"/>
   <img src="https://img.shields.io/badge/VampSecure-Labs-magenta" alt="VampSecure Labs"/>
   <img src="https://github.com/Vampsecure-Labs/vamp-log-analyzer/actions/workflows/ci.yml/badge.svg" alt="CI"/>
 </p>
@@ -54,6 +54,7 @@ La detección del tipo de log es automática (`--type auto`, predeterminada).
 - **[v2.1] EvidencePackager** — empaqueta en ZIP sellado con MANIFEST SHA-256 para peritaje judicial con cadena de custodia
 - **[v2.1] NarrativeGenerator** — genera narrativa forense en español vía Ollama (local) o Claude API (cloud)
 - **[v2.1] StreamingAnalyzer** — monitorización en tiempo real de logs en crecimiento (modo `tail -f` con detección live)
+- **[v2.2] Motor de reglas Sigma** — carga y evalúa reglas Sigma (YAML) sobre el stream de eventos; `--sigma-rules FICHERO_O_DIR` acepta un fichero `.yml` o un directorio de reglas; genera hallazgos `SIGMA-*` con el id/título/nivel de la regla original; campo-map configurable para adaptar logs no estándar
 
 ## Requisitos
 
@@ -234,6 +235,7 @@ python3 vamp_log_analyzer.py /evidencias/ \
 | `--ioc-csv FILE` | — | Exportar IOCs en CSV para SIEM |
 | `--stix FICHERO.json` | — | Exportar bundle STIX 2.1 para MISP / OpenCTI / TheHive |
 | `--package FICHERO.zip` | — | Empaquetar evidencias en ZIP sellado con MANIFEST SHA-256 |
+| `--sigma-rules RUTA` | — | Fichero o directorio de reglas Sigma (YAML) a evaluar sobre el stream de eventos |
 | `-v / --verbose` | off | Salida detallada por evento |
 
 ## Detectores forenses (FORA-001 a FORA-025)
@@ -484,5 +486,14 @@ VampSecure Studios no asume responsabilidad por el uso no autorizado de esta her
 
 © VampSecure Studios — VampSecure Labs Security Research Division
 
-## Versión
-v2.1 — VampSecure Labs Security Research Division
+## Historial de versiones
+
+| Versión | Cambios principales |
+|---------|---------------------|
+| v2.2 | Motor de reglas Sigma — `--sigma-rules`, SigmaLoader + SigmaEngine, hallazgos `SIGMA-*` |
+| v2.1 | ScopeConfig, BaselineProfiler, STIX 2.1, EvidencePackager, NarrativeGenerator, StreamingAnalyzer |
+| v2.0 | 25 detectores FORA, multi-fuente, enriquecimiento GeoIP, MITRE ATT&CK |
+
+---
+
+© VampSecure Studios — VampSecure Labs Security Research Division
