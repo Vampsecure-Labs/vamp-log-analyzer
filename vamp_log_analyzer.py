@@ -95,7 +95,10 @@ import sys
 import tempfile
 import textwrap
 import time
+import base64
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -112,7 +115,7 @@ except ImportError:
 # VERSIÓN Y METADATOS
 # ============================================================
 
-VERSION = "2.2"
+VERSION = "2.3"
 TOOL = "vamp-log-analyzer"
 FINDING_PREFIX = "FORA"
 
@@ -4352,6 +4355,155 @@ def print_summary(report: Report) -> None:
     print(f"{'═' * 60}\n")
 
 
+# ---------------------------------------------------------------------------
+# Modo --watch-wazuh-api (VampPurple P7 — loop purple sin ingesta manual)
+# ---------------------------------------------------------------------------
+
+def _wazuh_api_request(
+    base_url: str,
+    path: str,
+    token: str,
+    params: Optional[dict] = None,
+    verify_ssl: bool = True,
+) -> dict:
+    """Realiza una petición GET autenticada a la API REST de Wazuh."""
+    url = base_url.rstrip("/") + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    ctx = ssl.create_default_context() if verify_ssl else ssl.create_default_context()
+    if not verify_ssl:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _wazuh_api_auth(base_url: str, user: str, password: str, verify_ssl: bool) -> str:
+    """Autentica contra la API Wazuh y devuelve el JWT token."""
+    url = base_url.rstrip("/") + "/security/user/authenticate"
+    creds = base64.b64encode(f"{user}:{password}".encode()).decode()
+    ctx = ssl.create_default_context() if verify_ssl else ssl.create_default_context()
+    if not verify_ssl:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(
+        url, method="POST",
+        headers={"Authorization": f"Basic {creds}"},
+    )
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            return data["data"]["token"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"Autenticación Wazuh fallida ({e.code}): {body}") from e
+
+
+def _modo_watch_wazuh_api(args: argparse.Namespace) -> int:
+    """
+    Modo de vigilancia en tiempo real contra la API REST de Wazuh.
+
+    Conecta a la API Wazuh (puerto 55000), obtiene un JWT, y sondea
+    el endpoint /alerts periódicamente para recuperar alertas nuevas.
+    Las alertas se muestran en consola y se escriben en NDJSON si se
+    especifica --wazuh-output, listas para ser consumidas por VampPurple.
+
+    Ctrl+C para detener el bucle.
+    """
+    console = Console()
+    base_url = args.watch_wazuh_api.rstrip("/")
+    if not base_url.startswith("http"):
+        base_url = "https://" + base_url
+    user     = getattr(args, "wazuh_user", None) or os.environ.get("WAZUH_USER", "wazuh")
+    password = getattr(args, "wazuh_password", None) or os.environ.get("WAZUH_PASSWORD", "")
+    if not password:
+        import getpass
+        password = getpass.getpass(f"  Contraseña Wazuh [{user}]: ")
+    intervalo   = int(getattr(args, "wazuh_interval", 30) or 30)
+    min_level   = int(getattr(args, "wazuh_min_level", 7) or 7)
+    salida_path = getattr(args, "wazuh_output", None)
+    verify_ssl  = not getattr(args, "wazuh_no_verify", False)
+
+    console.print(Panel(
+        f"[bold]API:[/bold] {base_url}  ·  "
+        f"[bold]Nivel mínimo:[/bold] {min_level}  ·  "
+        f"[bold]Intervalo:[/bold] {intervalo}s"
+        + (f"\n[bold]Salida NDJSON:[/bold] {salida_path}" if salida_path else ""),
+        title=f"[bold magenta]{TOOL} v{VERSION} — Modo watch-wazuh-api[/bold magenta]",
+        border_style="magenta",
+    ))
+
+    try:
+        token = _wazuh_api_auth(base_url, user, password, verify_ssl)
+    except Exception as exc:
+        console.print(f"[bold red][!] {exc}[/bold red]")
+        return 2
+
+    token_ts          = time.time()
+    TOKEN_TTL_S       = 3600 - 60  # refrescar antes de la expiración del JWT (1h por defecto)
+    ya_vistos: set    = set()
+    salida_fp         = open(salida_path, "a", encoding="utf-8") if salida_path else None  # noqa: WPS515
+
+    console.print(f"[green]✓ Autenticado. Sondeando cada {intervalo}s (Ctrl+C para salir)…[/green]")
+
+    try:
+        while True:
+            # Refrescar token si está cerca de expirar
+            if time.time() - token_ts > TOKEN_TTL_S:
+                try:
+                    token    = _wazuh_api_auth(base_url, user, password, verify_ssl)
+                    token_ts = time.time()
+                    console.print("[dim]→ Token JWT renovado[/dim]")
+                except Exception as e:
+                    console.print(f"[yellow][!] No se pudo renovar el token: {e}[/yellow]")
+
+            try:
+                resp = _wazuh_api_request(
+                    base_url, "/alerts",
+                    token,
+                    params={"q": f"rule.level>={min_level}", "sort": "-timestamp", "limit": 100},
+                    verify_ssl=verify_ssl,
+                )
+            except Exception as e:
+                console.print(f"[yellow][!] Error al consultar /alerts: {e}[/yellow]")
+                time.sleep(intervalo)
+                continue
+
+            alertas = (resp.get("data") or {}).get("affected_items") or []
+            nuevas  = [a for a in alertas if a.get("id") not in ya_vistos]
+
+            for alerta in reversed(nuevas):  # cronológico
+                a_id = alerta.get("id", "")
+                ya_vistos.add(a_id)
+                regla     = alerta.get("rule", {})
+                nivel     = regla.get("level", 0)
+                descr     = regla.get("description", "")
+                agente    = alerta.get("agent", {}).get("name", "?")
+                timestamp = alerta.get("timestamp", "")
+                color     = "red" if nivel >= 12 else ("yellow" if nivel >= 7 else "dim")
+                console.print(
+                    f"[{color}][Nivel {nivel:>2}][/{color}]  "
+                    f"[bold]{agente}[/bold]  {timestamp[:19]}  {descr}"
+                )
+                if salida_fp:
+                    salida_fp.write(json.dumps(alerta, ensure_ascii=False) + "\n")
+                    salida_fp.flush()
+
+            if nuevas:
+                console.print(f"[dim]  → {len(nuevas)} alerta(s) nueva(s). Total vistas: {len(ya_vistos)}[/dim]")
+
+            time.sleep(intervalo)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Detenido por el usuario.[/yellow]")
+    finally:
+        if salida_fp:
+            salida_fp.close()
+
+    return 0
+
+
 def main() -> int:
     print_banner()
     parser = argparse.ArgumentParser(
@@ -4437,6 +4589,23 @@ def main() -> int:
     parser.add_argument("--follow", metavar="FICHERO",
                         help="Modo streaming: monitorizar fichero en tiempo real (tail -f)")
 
+    # Modo --watch-wazuh-api (VampPurple P7)
+    parser.add_argument("--watch-wazuh-api", metavar="HOST[:PUERTO]", dest="watch_wazuh_api",
+                        help="Vigilancia en tiempo real vía API REST Wazuh (puerto 55000). "
+                             "Ejemplo: --watch-wazuh-api https://wazuh.empresa.local:55000")
+    parser.add_argument("--wazuh-user", metavar="USUARIO", dest="wazuh_user", default="",
+                        help="Usuario API Wazuh (default: var. entorno WAZUH_USER o 'wazuh')")
+    parser.add_argument("--wazuh-password", metavar="CLAVE", dest="wazuh_password", default="",
+                        help="Contraseña API Wazuh (default: var. entorno WAZUH_PASSWORD o prompt)")
+    parser.add_argument("--wazuh-interval", metavar="S", dest="wazuh_interval", type=int, default=30,
+                        help="Intervalo de sondeo en segundos (default: 30)")
+    parser.add_argument("--wazuh-min-level", metavar="N", dest="wazuh_min_level", type=int, default=7,
+                        help="Nivel mínimo de regla Wazuh a reportar (default: 7)")
+    parser.add_argument("--wazuh-output", metavar="FICHERO", dest="wazuh_output",
+                        help="Fichero NDJSON de salida para ingesta VampPurple (append)")
+    parser.add_argument("--wazuh-no-verify", action="store_true", dest="wazuh_no_verify",
+                        help="Deshabilitar verificación TLS del servidor Wazuh (no recomendado)")
+
     args = parser.parse_args()
 
     # --- Modo --scope-example ---
@@ -4445,9 +4614,15 @@ def main() -> int:
         return 0
 
     # --- Sin argumentos ---
-    if not args.paths and not getattr(args, "follow", None):
+    if (not args.paths
+            and not getattr(args, "follow", None)
+            and not getattr(args, "watch_wazuh_api", None)):
         parser.print_help()
         return 0
+
+    # --- Modo --watch-wazuh-api (VampPurple P7) ---
+    if getattr(args, "watch_wazuh_api", None):
+        return _modo_watch_wazuh_api(args)
 
     # --- Modo --follow (streaming, no necesita paths obligatorios) ---
     if getattr(args, "follow", None):

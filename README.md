@@ -4,7 +4,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white" alt="Python 3.9+"/>
   <img src="https://img.shields.io/badge/stdlib%20only-no%20deps-brightgreen" alt="stdlib only"/>
-  <img src="https://img.shields.io/badge/version-2.2-orange" alt="v2.2"/>
+  <img src="https://img.shields.io/badge/version-2.3-orange" alt="v2.3"/>
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0-green" alt="License AGPL-3.0"/>
   <img src="https://img.shields.io/badge/VampSecure-Labs-magenta" alt="VampSecure Labs"/>
@@ -55,6 +55,7 @@ La detección del tipo de log es automática (`--type auto`, predeterminada).
 - **[v2.1] NarrativeGenerator** — genera narrativa forense en español vía Ollama (local) o Claude API (cloud)
 - **[v2.1] StreamingAnalyzer** — monitorización en tiempo real de logs en crecimiento (modo `tail -f` con detección live)
 - **[v2.2] Motor de reglas Sigma** — carga y evalúa reglas Sigma (YAML) sobre el stream de eventos; `--sigma-rules FICHERO_O_DIR` acepta un fichero `.yml` o un directorio de reglas; genera hallazgos `SIGMA-*` con el id/título/nivel de la regla original; campo-map configurable para adaptar logs no estándar
+- **[v2.3] Vigilancia Wazuh API en tiempo real** — `--watch-wazuh-api HOST[:PUERTO]` conecta a la API REST Wazuh (JWT), sondea `/alerts` periódicamente y escribe alertas en NDJSON (`--wazuh-output`); cierra el loop purple de VampPurple (P7) sin ingesta manual
 
 ## Requisitos
 
@@ -490,6 +491,7 @@ VampSecure Studios no asume responsabilidad por el uso no autorizado de esta her
 
 | Versión | Cambios principales |
 |---------|---------------------|
+| v2.3 | Vigilancia Wazuh API en tiempo real — `--watch-wazuh-api`, JWT, NDJSON, VampPurple P7 |
 | v2.2 | Motor de reglas Sigma — `--sigma-rules`, SigmaLoader + SigmaEngine, hallazgos `SIGMA-*` |
 | v2.1 | ScopeConfig, BaselineProfiler, STIX 2.1, EvidencePackager, NarrativeGenerator, StreamingAnalyzer |
 | v2.0 | 25 detectores FORA, multi-fuente, enriquecimiento GeoIP, MITRE ATT&CK |

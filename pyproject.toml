@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vamp-log-analyzer"
-version = "2.2"
+version = "2.3"
 description = "Log analysis and threat correlation engine for authorized security reviews"
 readme = "README.md"
 license = { text = "AGPL-3.0-only" }
