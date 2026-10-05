@@ -8,6 +8,7 @@
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License MIT"/>
   <img src="https://img.shields.io/badge/VampSecure-Labs-magenta" alt="VampSecure Labs"/>
+  <img src="https://github.com/Vampsecure-Labs/vamp-log-analyzer/actions/workflows/ci.yml/badge.svg" alt="CI"/>
 </p>
 
 ## Overview
@@ -264,6 +265,31 @@ python3 vamp_log_analyzer.py /evidencias/ \
 | FORA-023 | Baliza C2 (beacon) | HIGH | Peticiones HTTP a intervalos regulares desde un único agente (posible mando y control) |
 | FORA-024 | Fuerza bruta lenta (slow drip) | MEDIUM | Intentos de contraseña distribuidos en horas para evadir rate limiting |
 | FORA-025 | Anomalía en tamaño de respuesta POST | HIGH | Respuestas grandes a peticiones POST (posible exfiltración vía formulario o API) |
+
+## Sample Output
+
+```
+  vamp-log-analyzer v2.1 · analyzing /var/log/nginx/access.log (1.2 GB)
+  ──────────────────────────────────────────────────────────────────────
+  [+] 847,231 events parsed · 25 detectors active · baseline: loaded
+
+  ┌─ CRITICAL ──────────────────────────────────────────────────────────┐
+  │  FORA-024  Distributed brute-force (slow drip over 4h 23min)        │
+  │  Source: 34 IPs · 1,247 failed logins · Admin accounts: root, admin │
+  │  First seen: 2026-10-03T02:14:17Z                                   │
+  │  ATT&CK: T1110.001 (Password Guessing)                              │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  [HIGH]   FORA-003  SQL injection attempts detected (47 requests from 18.197.x.x)
+  [HIGH]   FORA-007  Path traversal: ../../../../etc/passwd (6 sources)
+  [MEDIUM] FORA-015  Directory enumeration: 2,341 404s in 8min (gobuster pattern)
+  [MEDIUM] FORA-019  Suspicious large response: 18.4 MB at /api/export
+  [INFO]   FORA-025  New IP geolocation: RU (first appearance in 90d baseline)
+
+  ──────────────────────────────────────────────────
+  Δ vs baseline: +3 new anomaly types · -1 known pattern
+  Total: 6 findings · STIX bundle: 23 objects
+```
 
 ## Formatos de salida
 
