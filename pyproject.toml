@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vamp-log-analyzer"
-version = "2.3"
+version = "2.4.0"
 description = "Log analysis and threat correlation engine for authorized security reviews"
 readme = "README.md"
 license = { text = "AGPL-3.0-only" }
@@ -33,4 +33,4 @@ Homepage = "https://github.com/Vampsecure-Labs/vamp-log-analyzer"
 Repository = "https://github.com/Vampsecure-Labs/vamp-log-analyzer"
 
 [tool.setuptools]
-py-modules = ["vamp_log_analyzer"]
+packages = ["vamp_log_analyzer"]
