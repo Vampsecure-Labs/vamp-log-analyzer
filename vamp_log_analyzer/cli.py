@@ -6,7 +6,6 @@ import datetime
 import json
 import os
 import pathlib
-import re
 import ssl
 import sys
 import textwrap
@@ -14,7 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional
+from typing import List, Optional
 try:
     from rich.console import Console
     from rich.panel import Panel
@@ -27,12 +26,11 @@ except ImportError:
         def __init__(self, *a, **kw): pass
 console = Console()
 from ._models import (
-    VERSION, TOOL, TOOL_NAME, BANNER, ScopeConfig,
-    _ANSI_BOLD_MAGENTA, _ANSI_RESET, _severity_rank, FINDING_PREFIX,
+    VERSION, TOOL, BANNER, ScopeConfig, Report,
+    _ANSI_BOLD_MAGENTA, _ANSI_RESET, _severity_rank,
 )
 from ._core import (
-    analyze_files, detect_log_type,
-    SigmaLoader, SigmaRule,
+    analyze_files, SigmaLoader, SigmaRule,
     StreamingAnalyzer, BaselineProfiler, NarrativeGenerator,
 )
 from ._report import (

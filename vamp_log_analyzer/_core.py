@@ -3,11 +3,9 @@ from __future__ import annotations
 import base64
 import collections
 import csv
-import dataclasses
 import datetime
 import gzip
 import hashlib
-import io
 import ipaddress
 import json
 import os
@@ -21,7 +19,6 @@ import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
-import zipfile
 from typing import Dict, Generator, List, Optional, Tuple
 try:
     import yaml as _yaml
@@ -29,17 +26,15 @@ try:
 except ImportError:
     _YAML_OK = False
 from ._models import (
-    VERSION, TOOL, TOOL_NAME, FINDING_PREFIX,
+    VERSION, TOOL, FINDING_PREFIX,
     RE_SQLI, RE_XSS, RE_TRAVERSAL, RE_WEBSHELL, RE_RFI,
     RE_SCANNER_UA, RE_SCANNER_PATH, RE_SENSITIVE_FILES,
-    RE_SUDO_PRIVESC, RE_SU_ROOT, RE_SUID_WRITE, RE_CRON_SUSPICIOUS,
+    RE_SUDO_PRIVESC, RE_CRON_SUSPICIOUS,
     RE_LATERAL_SSH, RE_ROOT_LOGIN, RE_WIN_SUSPICIOUS_CMD, RE_WIN_LSASS,
     RE_WIN_LATERAL, RE_WIN_PERSISTENCE, RE_WIN_EVASION,
     RE_APACHE, _APACHE_TS_FMT, RE_MYSQL_TS, RE_MYSQL_GEN, RE_MYSQL_SLOW,
     RE_MONGO_TS, RE_AUTH_TS, RE_AUTH_SSH_FAIL, RE_AUTH_SSH_OK,
     RE_AUTH_SUDO, RE_AUTH_SU, RE_AUTH_NEW_USER, RE_AUTH_CRON,
-    RE_SYSLOG_TS, RE_GENERIC_TS, RE_GENERIC_IP,
-    RE_OSSEC_ALERT_HDR, RE_OSSEC_HOST_LINE,
     MITRE_MAPPING, BEACON_EXCLUDE_PATHS, _SIGMA_FIELD_MAP,
     _severity_rank, _ip_is_private,
     _BSD_MONTHS, _CURRENT_YEAR,

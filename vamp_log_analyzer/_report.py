@@ -5,19 +5,15 @@ import datetime
 import hashlib
 import io
 import json
-import os
 import pathlib
-import re
-import sys
-import tempfile
 import textwrap
 import uuid
 import zipfile
-from typing import Dict, List, Optional
+from typing import Dict, List
 from ._models import (
-    VERSION, TOOL, TOOL_NAME, FINDING_PREFIX, _severity_rank,
+    VERSION, TOOL, _severity_rank,
     MITRE_MAPPING, _ip_is_private,
-    LogEvent, Finding, Report, SigmaRule,
+    Report,
 )
 
 class STIXExporter:
