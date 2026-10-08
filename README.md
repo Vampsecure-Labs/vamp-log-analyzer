@@ -472,6 +472,41 @@ El informe forense TXT incluye:
 - **[v2.1]** Análisis diferencial contra baseline (si se proporciona)
 - **[v2.1]** Narrativa del incidente generada por IA (si se activa)
 
+## Why vamp-log-analyzer vs. Splunk · Elastic SIEM · Graylog
+
+| Feature | vamp-log-analyzer | Splunk | Elastic SIEM | Graylog |
+|---------|:-----------------:|:------:|:------------:|:-------:|
+| Zero external dependencies (stdlib only) | ✅ | ❌ | ❌ | ❌ |
+| Offline / air-gapped forensics | ✅ | ❌ | ❌ | ❌ |
+| STIX 2.1 bundle export | ✅ | ❌ | ✅ | ❌ |
+| Evidence package with SHA-256 chain of custody | ✅ | ❌ | ❌ | ❌ |
+| Sigma rules evaluation | ✅ | ✅ | ✅ | ✅ |
+| AI narrative generation (Ollama / Claude) | ✅ | ❌ | ❌ | ❌ |
+| Baseline differential analysis (delta) | ✅ | ✅ | ✅ | ❌ |
+| Single-file deployment, no agent or index required | ✅ | ❌ | ❌ | ❌ |
+
+- **Forensically sound out of the box.** SHA-256 chain of custody, analyst/case metadata, and ZIP evidence packaging are first-class features — not add-ons. Splunk and Elastic require custom workflows to achieve the same result.
+- **No infrastructure required.** Run it on a laptop in an air-gapped investigation room. Splunk/Elastic/Graylog require deployed stacks, indexes, and agents before any analysis can begin.
+- **Purpose-built for incident response and legal proceedings.** The `--report-forensic` output follows peritaje judicial format (Spain ENS/LOPD) with numbered sections, perito identification, and hash verification — not a generic dashboard.
+- **STIX 2.1 + MITRE ATT&CK natively.** Findings map to ATT&CK techniques and export as importable STIX 2.1 bundles for MISP, OpenCTI, or TheHive — without a paid connector or plugin.
+
+## Check Coverage
+
+| Check ID | Description | Standard | Severity |
+|----------|-------------|----------|----------|
+| FORA-001 | Brute-force on SSH / FTP / Telnet (repeated authentication failures) | MITRE T1110.001 | HIGH |
+| FORA-004 | SQL injection patterns in HTTP requests (Union, Blind, Time-based) | OWASP A03:2021 · MITRE T1190 | CRITICAL |
+| FORA-007 | Path traversal / LFI / RFI in URI parameters | OWASP A01:2021 · MITRE T1083 | CRITICAL |
+| FORA-008 | Webshell access or RCE parameter detected in web logs | MITRE T1505.003 | CRITICAL |
+| FORA-013 | Privilege escalation via sudo/su with dangerous commands | MITRE T1548.003 | HIGH |
+| FORA-014 | Privileged account creation or modification detected | MITRE T1136 | CRITICAL |
+| FORA-018 | Lateral movement: admin-protocol connections between internal hosts | MITRE T1021 | HIGH |
+| FORA-020 | Direct root/SYSTEM login via SSH or console | MITRE T1078.003 | CRITICAL |
+| FORA-022 | Credential stuffing: distinct IPs using same credentials with success | MITRE T1110.004 | HIGH |
+| FORA-023 | C2 beacon: periodic HTTP calls at fixed intervals from single agent | MITRE T1071.001 | HIGH |
+| FORA-024 | Slow-drip brute force distributed over hours to evade rate limiting | MITRE T1110 | MEDIUM |
+| SIGMA-* | Custom Sigma rule match (YAML-defined, user-supplied ruleset) | Sigma Specification | Variable |
+
 ## Aviso legal
 
 Uso exclusivo en sistemas propios o con autorización escrita del titular.
