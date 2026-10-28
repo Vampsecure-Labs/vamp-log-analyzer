@@ -4,7 +4,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white" alt="Python 3.9+"/>
   <img src="https://img.shields.io/badge/stdlib%20only-no%20deps-brightgreen" alt="stdlib only"/>
-  <img src="https://img.shields.io/badge/version-2.4-orange" alt="v2.4"/>
+  <img src="https://img.shields.io/badge/version-2.4.0-orange" alt="v2.4"/>
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0-green" alt="License AGPL-3.0"/>
   <img src="https://img.shields.io/badge/VampSecure-Labs-magenta" alt="VampSecure Labs"/>
@@ -262,7 +262,7 @@ python3 vamp_log_analyzer.py --follow /var/log/nginx/access.log
 ### Sample Output
 
 ```
-  vamp-log-analyzer v2.4 · analyzing /var/log/nginx/access.log (1.2 GB)
+  vamp-log-analyzer v2.4.0 · analyzing /var/log/nginx/access.log (1.2 GB)
   ──────────────────────────────────────────────────────────────────────
   [+] 847,231 events parsed · 25 detectors active · baseline: loaded
 
